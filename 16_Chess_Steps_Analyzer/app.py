@@ -27,18 +27,23 @@ def load_assets():
         temperature=0.2
     )
     
-    # Identify Stockfish Path
-    # On Streamlit Cloud (Linux), 'packages.txt' installs it to /usr/games/stockfish
+    # 1. Try the standard Debian/Ubuntu location (from packages.txt)
     linux_path = "/usr/games/stockfish"
-    # windows_path = os.path.join('stockfish', 'stockfish.exe')
     
-    engine_path = linux_path if os.path.exists(linux_path) else "/stockfish"
+    # 2. Try the global system PATH (fallback)
+    fallback_path = "stockfish"
+
+    if os.path.exists(linux_path):
+        engine_path = linux_path
+    else:
+        # If /usr/games/stockfish doesn't exist, we assume it's in the PATH
+        engine_path = fallback_path
     
     try:
         sf = Stockfish(path=engine_path, parameters={"Threads": 2, "Minimum Thinking Time": 30})
         return chat, sf
     except Exception as e:
-        st.warning(f"Stockfish engine not found. AI opponent disabled. Error: {e}")
+        st.warning(f"Stockfish not found. Tried: {linux_path} and '{fallback_path}'. Error: {e}")
         return chat, None
 
 chat_model, stockfish = load_assets()
