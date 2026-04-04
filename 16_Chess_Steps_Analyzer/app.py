@@ -30,9 +30,9 @@ def load_assets():
     # Identify Stockfish Path
     # On Streamlit Cloud (Linux), 'packages.txt' installs it to /usr/games/stockfish
     linux_path = "/usr/games/stockfish"
-    windows_path = os.path.join('stockfish', 'stockfish.exe')
+    # windows_path = os.path.join('stockfish', 'stockfish.exe')
     
-    engine_path = linux_path if os.path.exists(linux_path) else windows_path
+    engine_path = linux_path if os.path.exists(linux_path) else "/stockfish"
     
     try:
         sf = Stockfish(path=engine_path, parameters={"Threads": 2, "Minimum Thinking Time": 30})
