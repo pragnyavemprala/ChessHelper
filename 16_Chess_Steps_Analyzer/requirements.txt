@@ -4,3 +4,4 @@ langchain-openai
 pandas
 openai
 stockfish
+chess
