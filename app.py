@@ -7,15 +7,6 @@ from stockfish import Stockfish
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 
-# --- DEBUG SECTION ---
-st.sidebar.subheader("System Debug")
-debug_path = os.popen("which stockfish").read().strip()
-if debug_path:
-    st.sidebar.success(f"Stockfish found at: {debug_path}")
-else:
-    st.sidebar.error("Stockfish NOT found in system PATH")
-# ---------------------
-
 # --- 1. Load Secrets (Configure these in Streamlit Cloud Dashboard) ---
 try:
     API_KEY = st.secrets["OPENAI_API_KEY"]
@@ -49,7 +40,7 @@ def load_assets():
             # Test if this path works
             test_sf = Stockfish(path=path)
             sf = test_sf
-            st.success(f"Stockfish engine loaded from: {path}")
+            # st.success(f"Stockfish engine loaded from: {path}")
             break
         except Exception:
             continue
