@@ -20,7 +20,7 @@ except Exception as e:
 @st.cache_resource
 def load_assets():
     # Initialize LangChain 1.0 Chat Model
-    chat = init_chat_model(
+    chat_model = init_chat_model(
         MODEL_ID, 
         model_provider="openai", 
         api_key=API_KEY,
