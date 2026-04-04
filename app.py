@@ -152,7 +152,51 @@ with col1:
 
 with col2:
     st.subheader("Coach's Corner")
-    st.info(st.session_state.coach_text)
+    # --- Dynamic Coloring Logic ---
+    # Default color (light grey)
+    bg_color = "#f0f2f6" 
+    text_color = "#000000"
+    
+    # Determine color based on the latest verdict
+    if st.session_state.move_history:
+        # Get the verdict of the last player move
+        # (AI moves are at odd indices, Player moves at even indices)
+        last_index = len(st.session_state.move_history) - 1
+        # If the last move in history was the AI's, look at the one before it
+        if st.session_state.move_history[last_index]["san"] == "...":
+             last_index -= 1
+        
+        # Ensure we are looking at a move that has a verdict
+        latest_verdict = st.session_state.move_history[last_index].get("verdict", "")
+
+        if "[GOOD]" in latest_verdict:
+            bg_color = "#d4edda"  # Light Green
+        elif "[INACCURACY]" in latest_verdict:
+            bg_color = "#fff3cd"  # Yellow
+        elif "[MISTAKE]" in latest_verdict:
+            bg_color = "#ffe5d0"  # Orange
+        elif "[BLUNDER]" in latest_verdict:
+            bg_color = "#f8d7da"  # Red
+
+    # Render the Coach's Corner with custom HTML
+    st.markdown(
+        f"""
+        <div style="
+            background-color: {bg_color}; 
+            padding: 20px; 
+            border-radius: 10px; 
+            border-left: 5px solid rgba(0,0,0,0.1);
+            color: {text_color};
+            font-size: 16px;
+            line-height: 1.6;
+        ">
+            {st.session_state.coach_text}
+        </div>
+        """, 
+        unsafe_allow_html=True
+    )
+    
+    # --- End of Dynamic Coloring ---
     
     if st.button("Restart Game"):
         st.session_state.board = chess.Board()
