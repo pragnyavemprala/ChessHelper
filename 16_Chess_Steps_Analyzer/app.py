@@ -27,24 +27,21 @@ def load_assets():
         temperature=0.2
     )
     
-    # 1. Try the standard Debian/Ubuntu location (from packages.txt)
-    linux_path = "/usr/games/stockfish"
-    
-    # 2. Try the global system PATH (fallback)
-    fallback_path = "stockfish"
+    sf = None
+    for path in possible_paths:
+        try:
+            # Test if this path works
+            test_sf = Stockfish(path=path)
+            sf = test_sf
+            st.success(f"Stockfish engine loaded from: {path}")
+            break
+        except Exception:
+            continue
 
-    if os.path.exists(linux_path):
-        engine_path = linux_path
-    else:
-        # If /usr/games/stockfish doesn't exist, we assume it's in the PATH
-        engine_path = fallback_path
+    if sf is None:
+        st.error("Engine Error: Stockfish not found. Please ensure 'packages.txt' contains 'stockfish' and the app was fully rebooted.")
     
-    try:
-        sf = Stockfish(path=engine_path, parameters={"Threads": 2, "Minimum Thinking Time": 30})
-        return chat, sf
-    except Exception as e:
-        st.warning(f"Stockfish not found. Tried: {linux_path} and '{fallback_path}'. Error: {e}")
-        return chat, None
+    return chat_model, sf
 
 chat_model, stockfish = load_assets()
 
