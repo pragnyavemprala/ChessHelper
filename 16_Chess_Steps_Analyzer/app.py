@@ -26,6 +26,13 @@ def load_assets():
         api_key=API_KEY,
         temperature=0.2
     )
+
+    # Possible Linux locations for Stockfish installed via apt
+    possible_paths = [
+        "/usr/games/stockfish",   # Standard location
+        "/usr/bin/stockfish",     # Alternative
+        "stockfish"               # Try calling globally via PATH
+    ]
     
     sf = None
     for path in possible_paths:
