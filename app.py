@@ -93,7 +93,17 @@ col1, col2 = st.columns([2, 1])
 with col1:
     # Display the Board
     st.write(render_board(st.session_state.board), unsafe_allow_html=True)
-    
+
+    # Place this before your columns or main logic
+    st.sidebar.header("Settings")
+
+    current_skill_level = st.sidebar.slider(
+        "AI Difficulty (Skill Level)", 
+        min_value=1, 
+        max_value=20, 
+        value=5,  # Default starting level
+        help="1 is easiest, 20 is Grandmaster level."
+    )
     # Move Input Form
     with st.form(key="chess_move_form", clear_on_submit=True):
         move_input = st.text_input("Enter Move (SAN notation, e.g., e4, Nf3, O-O):")
@@ -115,6 +125,8 @@ with col1:
                 
                 # 3. Trigger AI Counter-move (Stockfish)
                 if not st.session_state.board.is_game_over() and stockfish:
+                    stockfish.set_skill_level(current_skill_level)
+
                     stockfish.set_fen_position(st.session_state.board.fen())
                     best_move_uci = stockfish.get_best_move()
                     if best_move_uci:
