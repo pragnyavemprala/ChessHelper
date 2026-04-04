@@ -132,7 +132,11 @@ with col1:
                     stockfish.set_skill_level(current_skill_level)
 
                     stockfish.set_fen_position(st.session_state.board.fen())
-                    best_move_uci = stockfish.get_best_move()
+                    # Instead of get_best_move() which waits for full calculation,
+                    # use a time limit. Lower difficulty + lower time = more mistakes.
+                    # We can scale the time slightly based on difficulty.
+                    think_time = 100 + (current_skill_level * 50) # e.g., Level 1 = 150ms, Level 20 = 1100ms
+                    best_move_uci = stockfish.get_best_move(think_time)
                     if best_move_uci:
                         ai_move = chess.Move.from_uci(best_move_uci)
                         ai_san = st.session_state.board.san(ai_move)
@@ -151,12 +155,30 @@ with col2:
     
     st.subheader("Move History")
     # Display the move list in a scrollable-like format
-    for i in range(0, len(st.session_state.move_history), 2):
-        move_num = (i // 2) + 1
-        white = st.session_state.move_history[i]['san']
-        black = st.session_state.move_history[i+1]['san'] if i+1 < len(st.session_state.move_history) else ""
-        #st.write(f"**{(i//2)+1}.** {white}   {black}")
-        # Using markdown for a cleaner look
+    # Calculate total number of moves (pairs)
+    total_moves = len(st.session_state.move_history)
+    # Step -2 means we jump backwards by 2 each time
+    for i in range(total_moves - (total_moves % 2), -1, -2):
+        # Ensure we don't try to access an index out of bounds
+        if i >= total_moves:
+            i = total_moves - 1
+            if i < 0: break
+
+        # Logic to find the start of the 'pair' (White's move)
+        # If i is odd, it's a Black move, so White is at i-1
+        # If i is even, it's a White move, so White is at i
+        start_of_pair = i if i % 2 == 0 else i - 1
+    
+        move_num = (start_of_pair // 2) + 1
+        white = st.session_state.move_history[start_of_pair]['san']
+    
+        # Black move only exists if the history is long enough
+        black = ""
+        if start_of_pair + 1 < total_moves:
+            black = st.session_state.move_history[start_of_pair + 1]['san']
+        else:
+            black = "..." # AI is still thinking or game ended on White
+
         st.sidebar.markdown(f"**{move_num}.** {white} &nbsp;&nbsp; {black}")
 
     if st.button("Restart Game"):
