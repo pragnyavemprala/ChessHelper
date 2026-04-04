@@ -155,31 +155,18 @@ with col2:
     
     st.subheader("Move History")
     # Display the move list in a scrollable-like format
-    # Calculate total number of moves (pairs)
-    total_moves = len(st.session_state.move_history)
-    # Step -2 means we jump backwards by 2 each time
-    for i in range(total_moves - (total_moves % 2), -1, -2):
-        # Ensure we don't try to access an index out of bounds
-        if i >= total_moves:
-            i = total_moves - 1
-            if i < 0: break
+    # 1. Group moves into pairs: [(1, 'e4', 'e5'), (2, 'Nf3', 'Nc6')]
+    history = st.session_state.move_history
+    pairs = []
+    for i in range(0, len(history), 2):
+        move_num = (i // 2) + 1
+        w = history[i]['san']
+        b = history[i+1]['san'] if i+1 < len(history) else "..."
+        pairs.append((move_num, w, b))
 
-        # Logic to find the start of the 'pair' (White's move)
-        # If i is odd, it's a Black move, so White is at i-1
-        # If i is even, it's a White move, so White is at i
-        start_of_pair = i if i % 2 == 0 else i - 1
-    
-        move_num = (start_of_pair // 2) + 1
-        white = st.session_state.move_history[start_of_pair]['san']
-    
-        # Black move only exists if the history is long enough
-        black = ""
-        if start_of_pair + 1 < total_moves:
-            black = st.session_state.move_history[start_of_pair + 1]['san']
-        else:
-            black = "..." # AI is still thinking or game ended on White
-
-        st.sidebar.markdown(f"**{move_num}.** {white} &nbsp;&nbsp; {black}")
+    # 2. Reverse the list and display
+    for move_num, w, b in reversed(pairs):
+        st.sidebar.markdown(f"**{move_num}.** {w} &nbsp;&nbsp; {b}")
 
     if st.button("Restart Game"):
         st.session_state.board = chess.Board()
