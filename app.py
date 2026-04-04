@@ -88,14 +88,14 @@ if "board" not in st.session_state:
 st.set_page_config(page_title="AI Chess Coach", layout="wide")
 # st.title("♟️ Grandmaster AI Coach")
 
-col1, col2 = st.columns([2, 1])
+col1, col2 = st.columns([3, 2])
 
 with col1:
     # Display the Board
     st.write(render_board(st.session_state.board), unsafe_allow_html=True)
 
     # Place this before your columns or main logic
-    st.sidebar.header("Settings")
+    st.sidebar.header("Settings & All moves!")
 
     current_skill_level = st.sidebar.slider(
         "AI Difficulty (Skill Level)", 
@@ -104,6 +104,10 @@ with col1:
         value=5,  # Default starting level
         help="1 is easiest, 20 is Grandmaster level."
     )
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Move History")
+    
     # Move Input Form
     with st.form(key="chess_move_form", clear_on_submit=True):
         move_input = st.text_input("Enter Move (SAN notation, e.g., e4, Nf3, O-O):")
@@ -148,9 +152,12 @@ with col2:
     st.subheader("Move History")
     # Display the move list in a scrollable-like format
     for i in range(0, len(st.session_state.move_history), 2):
+        move_num = (i // 2) + 1
         white = st.session_state.move_history[i]['san']
         black = st.session_state.move_history[i+1]['san'] if i+1 < len(st.session_state.move_history) else ""
-        st.write(f"**{(i//2)+1}.** {white}   {black}")
+        #st.write(f"**{(i//2)+1}.** {white}   {black}")
+        # Using markdown for a cleaner look
+        st.sidebar.markdown(f"**{move_num}.** {white} &nbsp;&nbsp; {black}")
 
     if st.button("Restart Game"):
         st.session_state.board = chess.Board()
