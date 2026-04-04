@@ -86,7 +86,7 @@ if "board" not in st.session_state:
 
 # --- 5. Main UI Layout ---
 st.set_page_config(page_title="AI Chess Coach", layout="wide")
-st.title("♟️ Grandmaster AI Coach")
+# st.title("♟️ Grandmaster AI Coach")
 
 col1, col2 = st.columns([2, 1])
 
