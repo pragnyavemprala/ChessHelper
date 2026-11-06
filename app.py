@@ -78,6 +78,10 @@ if "board" not in st.session_state:
     st.session_state.move_history = []
     st.session_state.coach_text = "Welcome! Make a move to start the session."
 
+# Initialize chat history in session state
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+    
 # --- 5. Main UI Layout ---
 st.set_page_config(page_title="AI Chess Coach", layout="wide")
 
@@ -172,7 +176,28 @@ with col2:
         """, 
         unsafe_allow_html=True
     )
-    
+
+    # Display past chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Chat input box for interactive questions
+    if user_query := st.chat_input("Ask your coach about the position..."):
+        st.session_state.messages.append({"role": "user", "content": user_query})
+        with st.chat_message("user"):
+            st.markdown(user_query)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Coach is thinking..."):
+                messages = [SystemMessage(content=COACH_PROMPT)] + [
+                    HumanMessage(content=m["content"]) for m in st.session_state.messages
+                ]
+                response = chat_model.invoke(messages)
+                coach_reply = response.content
+                st.markdown(coach_reply)
+                st.session_state.messages.append({"role": "assistant", "content": coach_reply})
+                
     if st.button("Restart Game"):
         st.session_state.board = chess.Board()
         st.session_state.move_history = []
