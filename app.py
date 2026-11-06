@@ -400,12 +400,19 @@ def main():
 
             with st.chat_message("assistant"):
                 with st.spinner("Coach is thinking..."):
-                    messages = [SystemMessage(content=CONFIG["coach_prompt"])] + [
-                        HumanMessage(content=m["content"]) for m in st.session_state.messages
-                    ]
+                    # Properly map "user" -> HumanMessage and "assistant" -> AIMessage
+                    chat_history = []
+                    for m in st.session_state.messages:
+                        if m["role"] == "user":
+                            chat_history.append(HumanMessage(content=m["content"]))
+                        elif m["role"] == "assistant":
+                            chat_history.append(AIMessage(content=m["content"]))
+
+                    messages = [SystemMessage(content=CONFIG["coach_prompt"])] + chat_history
                     response = CHAT_MODEL.invoke(messages)
-                    st.markdown(response.content)
-                    st.session_state.messages.append({"role": "assistant", "content": response.content})
+                    coach_reply = response.content
+                    st.markdown(coach_reply)
+                    st.session_state.messages.append({"role": "assistant", "content": coach_reply})
 
         if st.button("Restart Game"):
             reset_game()
