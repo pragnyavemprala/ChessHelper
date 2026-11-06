@@ -152,19 +152,22 @@ def render_board(board):
 
 
 def get_coach_analysis(move_history):
-    """Generates immediate move feedback using LLM."""
     if not move_history:
         return ""
     moves_str = ", ".join([m["san"] for m in move_history])
+
+    # Safely interpolate {moves_str} into the prompt template
+    system_text = CONFIG["coach_prompt"].replace("{moves_str}", moves_str)
+
     messages = [
-        SystemMessage(content=CONFIG["coach_prompt"]),
-        HumanMessage(content=f"Moves played: {moves_str}. Analyze the quality of the very last move."),
+        SystemMessage(content=system_text),
+        HumanMessage(content=f"Current move history: {moves_str}. Analyze the last move played."),
     ]
     try:
         response = CHAT_MODEL.invoke(messages)
         return response.content
-    except Exception:
-        return "Coach is currently offline."
+    except Exception as e:
+        return f"Coach is currently offline: {e}"
 
 
 def generate_game_summary(move_history, result_text):
@@ -397,22 +400,33 @@ def main():
             st.session_state.messages.append({"role": "user", "content": user_query})
             with st.chat_message("user"):
                 st.markdown(user_query)
-
+                
             with st.chat_message("assistant"):
                 with st.spinner("Coach is thinking..."):
-                    # Properly map "user" -> HumanMessage and "assistant" -> AIMessage
-                    chat_history = []
-                    for m in st.session_state.messages:
-                        if m["role"] == "user":
-                            chat_history.append(HumanMessage(content=m["content"]))
-                        elif m["role"] == "assistant":
-                            chat_history.append(AIMessage(content=m["content"]))
-
-                    messages = [SystemMessage(content=CONFIG["coach_prompt"])] + chat_history
+                    # Provide current board position context to the coach
+                    current_moves = ", ".join([m["san"] for m in st.session_state.move_history])
+                    system_prompt = (
+                        f"You are a helpful chess coach. Current game moves: {current_moves}. "
+                        "Answer the player's questions clearly based on the board."
+                    )
+                    
+                chat_history = []
+                
+                for m in st.session_state.messages:
+                    if m["role"] == "user":
+                        chat_history.append(HumanMessage(content=m["content"]))
+                    elif m["role"] == "assistant":
+                        chat_history.append(AIMessage(content=m["content"]))
+                        
+                messages = [SystemMessage(content=system_prompt)] + chat_history
+                try:
                     response = CHAT_MODEL.invoke(messages)
                     coach_reply = response.content
-                    st.markdown(coach_reply)
-                    st.session_state.messages.append({"role": "assistant", "content": coach_reply})
+                except Exception as e:
+                    coach_reply = f"Error communicating with AI: {e}"
+                    
+                st.markdown(coach_reply)
+                st.session_state.messages.append({"role": "assistant", "content": coach_reply})
 
         if st.button("Restart Game"):
             reset_game()
