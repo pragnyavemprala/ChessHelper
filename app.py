@@ -118,8 +118,7 @@ def load_assets():
     chat_model = init_chat_model(
         CONFIG["model_id"],
         model_provider="openai",
-        api_key=CONFIG["openai_api_key"],
-        temperature=0.2,
+        api_key=CONFIG["openai_api_key"]
     )
 
     possible_paths = ["/usr/games/stockfish", "/usr/bin/stockfish", "stockfish"]
