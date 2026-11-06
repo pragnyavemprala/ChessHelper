@@ -5,3 +5,4 @@ pandas
 openai
 stockfish
 chess
+boto3
