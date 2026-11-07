@@ -309,7 +309,40 @@ def handle_game_completion():
                     st.toast("Game outcome recorded in DynamoDB!")
             st.session_state.game_saved = True
 
+def parse_player_move(board: chess.Board, text: str) -> chess.Move:
+    """
+    Parses user input into a valid chess.Move.
+    Accepts standard SAN, common castling variants (0-0, o-o), and UCI moves (e1g1).
+    """
+    cleaned = text.strip()
 
+    # Map common zero/lowercase castling typos to standard SAN
+    castling_map = {
+        "0-0-0": "O-O-O",
+        "o-o-o": "O-O-O",
+        "ooo": "O-O-O",
+        "0-0": "O-O",
+        "o-o": "O-O",
+        "oo": "O-O",
+    }
+    cleaned = castling_map.get(cleaned.lower(), cleaned)
+
+    # 1. Try standard SAN parser
+    try:
+        return board.parse_san(cleaned)
+    except ValueError:
+        pass
+
+    # 2. Try UCI parser as fallback (e.g. e1g1, e7e8q)
+    try:
+        uci_move = chess.Move.from_uci(cleaned.lower())
+        if uci_move in board.legal_moves:
+            return uci_move
+    except ValueError:
+        pass
+
+    raise ValueError(f"'{text}' is not recognized as a legal SAN or UCI move.")
+    
 # ==========================================
 # 7. Main Application Flow
 # ==========================================
@@ -342,7 +375,8 @@ def main():
                 error_placeholder.warning("Please enter your player name in the sidebar before moving.")
             else:
                 try:
-                    move = st.session_state.board.parse_san(move_input)
+                    #move = st.session_state.board.parse_san(move_input)
+                    move = parse_player_move(st.session_state.board, move_input)
                     if move in st.session_state.board.legal_moves:
                         san_move = st.session_state.board.san(move)
                         st.session_state.board.push(move)
