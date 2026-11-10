@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import base64
 from datetime import datetime, timezone
@@ -8,7 +9,7 @@ from boto3.dynamodb.conditions import Key
 import chess
 import chess.svg
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from stockfish import Stockfish
 import streamlit as st
 
@@ -210,6 +211,94 @@ def execute_ai_move(board, skill_level):
     return None
 
 
+def parse_player_move(board: chess.Board, text: str) -> chess.Move:
+    """
+    Parses user input into a valid chess.Move.
+    Accepts standard SAN, common castling variants (0-0, o-o), and UCI moves (e1g1).
+    """
+    cleaned = text.strip()
+
+    # Map common zero/lowercase castling typos to standard SAN
+    castling_map = {
+        "0-0-0": "O-O-O",
+        "o-o-o": "O-O-O",
+        "ooo": "O-O-O",
+        "0-0": "O-O",
+        "o-o": "O-O",
+        "oo": "O-O",
+    }
+    cleaned = castling_map.get(cleaned.lower(), cleaned)
+
+    # 1. Try standard SAN parser
+    try:
+        return board.parse_san(cleaned)
+    except ValueError:
+        pass
+
+    # 2. Try UCI parser as fallback (e.g. e1g1, e7e8q)
+    try:
+        uci_move = chess.Move.from_uci(cleaned.lower())
+        if uci_move in board.legal_moves:
+            return uci_move
+    except ValueError:
+        pass
+
+    raise ValueError(f"'{text}' is not recognized as a legal SAN or UCI move.")
+
+
+def load_game_from_notation(notation_text: str, current_skill_level: int):
+    """
+    Rebuilds game state and board from a raw SAN move list or PGN sequence.
+    Example inputs:
+      - 'e4 e5 Nf3 Nc6 Bc4'
+      - '1. e4 e5 2. Nf3 Nc6 3. Bc4'
+      - 'e4, e5, Nf3, Nc6'
+    """
+    raw = notation_text.replace(",", " ")
+    # Filter out turn numbering (1., 2...), annotations ($1, ?!), and result markers
+    tokens = re.split(r"\s+", raw.strip())
+    valid_tokens = [
+        t for t in tokens
+        if t and not re.match(r"^\d+\.+$", t) and t not in ["1-0", "0-1", "1/2-1/2", "*"]
+    ]
+
+    temp_board = chess.Board()
+    new_history = []
+
+    for idx, token in enumerate(valid_tokens):
+        # Strip trailing move numbers if formatted like '1.e4'
+        token = re.sub(r"^\d+\.+", "", token).strip()
+        if not token:
+            continue
+        try:
+            move = parse_player_move(temp_board, token)
+            san_str = temp_board.san(move)
+            temp_board.push(move)
+            # Human moves are at even indices (0, 2, ...), AI moves at odd indices (1, 3, ...)
+            verdict = "AI" if idx % 2 != 0 else ""
+            new_history.append({"san": san_str, "verdict": verdict})
+        except Exception:
+            return False, f"Illegal or unrecognized move '{token}' at position {idx + 1}."
+
+    # Update state with restored board
+    st.session_state.board = temp_board
+    st.session_state.move_history = new_history
+    st.session_state.game_saved = False
+    st.session_state.messages = []
+
+    # If the imported notation ended on White's turn (player's move), have Stockfish counter-move
+    if temp_board.turn == chess.BLACK and not temp_board.is_game_over():
+        ai_san = execute_ai_move(st.session_state.board, current_skill_level)
+        if ai_san:
+            st.session_state.move_history.append({"san": ai_san, "verdict": "AI"})
+
+    st.session_state.coach_text = (
+        f"Game restored to move {len(new_history)}. "
+        f"{'White' if st.session_state.board.turn == chess.WHITE else 'Black'} to move."
+    )
+    return True, "Game position successfully loaded!"
+
+
 # ==========================================
 # 5. Session State Management
 # ==========================================
@@ -309,40 +398,7 @@ def handle_game_completion():
                     st.toast("Game outcome recorded in DynamoDB!")
             st.session_state.game_saved = True
 
-def parse_player_move(board: chess.Board, text: str) -> chess.Move:
-    """
-    Parses user input into a valid chess.Move.
-    Accepts standard SAN, common castling variants (0-0, o-o), and UCI moves (e1g1).
-    """
-    cleaned = text.strip()
 
-    # Map common zero/lowercase castling typos to standard SAN
-    castling_map = {
-        "0-0-0": "O-O-O",
-        "o-o-o": "O-O-O",
-        "ooo": "O-O-O",
-        "0-0": "O-O",
-        "o-o": "O-O",
-        "oo": "O-O",
-    }
-    cleaned = castling_map.get(cleaned.lower(), cleaned)
-
-    # 1. Try standard SAN parser
-    try:
-        return board.parse_san(cleaned)
-    except ValueError:
-        pass
-
-    # 2. Try UCI parser as fallback (e.g. e1g1, e7e8q)
-    try:
-        uci_move = chess.Move.from_uci(cleaned.lower())
-        if uci_move in board.legal_moves:
-            return uci_move
-    except ValueError:
-        pass
-
-    raise ValueError(f"'{text}' is not recognized as a legal SAN or UCI move.")
-    
 # ==========================================
 # 7. Main Application Flow
 # ==========================================
@@ -375,7 +431,6 @@ def main():
                 error_placeholder.warning("Please enter your player name in the sidebar before moving.")
             else:
                 try:
-                    #move = st.session_state.board.parse_san(move_input)
                     move = parse_player_move(st.session_state.board, move_input)
                     if move in st.session_state.board.legal_moves:
                         san_move = st.session_state.board.san(move)
@@ -425,6 +480,31 @@ def main():
             unsafe_allow_html=True,
         )
 
+        # -----------------------------------------------------------------
+        # Snapshot / Game Restore Placeholder (Below Coach's Corner)
+        # -----------------------------------------------------------------
+        with st.expander("Resume Game from Snapshot Notation", expanded=False):
+            st.caption("Paste full PGN or moves (e.g., `1. e4 e5 2. Nf3 Nc6` or `e4 e5 Nf3 Nc6`).")
+            snapshot_input = st.text_area(
+                "Game Notation:",
+                placeholder="1. e4 e5 2. Nf3 Nc6 3. Bc4",
+                key="snapshot_notation_input",
+                height=100
+            )
+            if st.button("Load Snapshot & Continue"):
+                if not st.session_state.player_name:
+                    st.warning("Please enter your player name in the sidebar before restoring.")
+                elif not snapshot_input.strip():
+                    st.warning("Please paste valid game notation.")
+                else:
+                    success, msg = load_game_from_notation(snapshot_input, current_skill_level)
+                    if success:
+                        st.toast(msg, icon="♟️")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+        # Chat interaction
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
@@ -433,33 +513,31 @@ def main():
             st.session_state.messages.append({"role": "user", "content": user_query})
             with st.chat_message("user"):
                 st.markdown(user_query)
-                
+
             with st.chat_message("assistant"):
                 with st.spinner("Coach is thinking..."):
-                    # Provide current board position context to the coach
                     current_moves = ", ".join([m["san"] for m in st.session_state.move_history])
                     system_prompt = (
                         f"You are a helpful chess coach. Current game moves: {current_moves}. "
                         "Answer the player's questions clearly based on the board."
                     )
-                    
-                chat_history = []
-                
-                for m in st.session_state.messages:
-                    if m["role"] == "user":
-                        chat_history.append(HumanMessage(content=m["content"]))
-                    elif m["role"] == "assistant":
-                        chat_history.append(AIMessage(content=m["content"]))
-                        
-                messages = [SystemMessage(content=system_prompt)] + chat_history
-                try:
-                    response = CHAT_MODEL.invoke(messages)
-                    coach_reply = response.content
-                except Exception as e:
-                    coach_reply = f"Error communicating with AI: {e}"
-                    
-                st.markdown(coach_reply)
-                st.session_state.messages.append({"role": "assistant", "content": coach_reply})
+
+                    chat_history = []
+                    for m in st.session_state.messages:
+                        if m["role"] == "user":
+                            chat_history.append(HumanMessage(content=m["content"]))
+                        elif m["role"] == "assistant":
+                            chat_history.append(AIMessage(content=m["content"]))
+
+                    messages = [SystemMessage(content=system_prompt)] + chat_history
+                    try:
+                        response = CHAT_MODEL.invoke(messages)
+                        coach_reply = response.content
+                    except Exception as e:
+                        coach_reply = f"Error communicating with AI: {e}"
+
+                    st.markdown(coach_reply)
+                    st.session_state.messages.append({"role": "assistant", "content": coach_reply})
 
         if st.button("Restart Game"):
             reset_game()
