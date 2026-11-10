@@ -152,11 +152,10 @@ def render_board(board):
 
 
 def get_coach_analysis(move_history):
+    """Provides short tactical move feedback for the banner."""
     if not move_history:
         return ""
     moves_str = ", ".join([m["san"] for m in move_history])
-
-    # Safely interpolate {moves_str} into the prompt template
     system_text = CONFIG["coach_prompt"].replace("{moves_str}", moves_str)
 
     messages = [
@@ -168,6 +167,38 @@ def get_coach_analysis(move_history):
         return response.content
     except Exception as e:
         return f"Coach is currently offline: {e}"
+
+
+def get_conversational_coach_reply(board, move_history, chat_messages):
+    """
+    Carries out a continuous conversational dialog with the coach.
+    Preserves prior chat history and provides current board state/history context.
+    """
+    moves_str = ", ".join([m["san"] for m in move_history]) if move_history else "No moves made yet"
+    turn_str = "White" if board.turn == chess.WHITE else "Black"
+    
+    system_instructions = (
+        "You are an encouraging, insightful International Chess Grandmaster acting as a personal coach. "
+        "The player is playing as White against Stockfish (Black). Maintain an interactive, conversational tone. "
+        f"Game FEN: {board.fen()}\n"
+        f"Game Moves so far: {moves_str}\n"
+        f"Current Turn to Move: {turn_str}\n"
+        "Remember earlier discussion in this conversation. Answer the player's questions with specific board ideas, "
+        "tactical patterns, openings, or candidate plans. Keep answers engaging and concise (2-4 paragraphs max)."
+    )
+
+    formatted_messages = [SystemMessage(content=system_instructions)]
+    for msg in chat_messages:
+        if msg["role"] == "user":
+            formatted_messages.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            formatted_messages.append(AIMessage(content=msg["content"]))
+
+    try:
+        response = CHAT_MODEL.invoke(formatted_messages)
+        return response.content
+    except Exception as e:
+        return f"Sorry, I had trouble evaluating that: {e}"
 
 
 def generate_game_summary(move_history, result_text):
@@ -218,7 +249,6 @@ def parse_player_move(board: chess.Board, text: str) -> chess.Move:
     """
     cleaned = text.strip()
 
-    # Map common zero/lowercase castling typos to standard SAN
     castling_map = {
         "0-0-0": "O-O-O",
         "o-o-o": "O-O-O",
@@ -229,13 +259,11 @@ def parse_player_move(board: chess.Board, text: str) -> chess.Move:
     }
     cleaned = castling_map.get(cleaned.lower(), cleaned)
 
-    # 1. Try standard SAN parser
     try:
         return board.parse_san(cleaned)
     except ValueError:
         pass
 
-    # 2. Try UCI parser as fallback (e.g. e1g1, e7e8q)
     try:
         uci_move = chess.Move.from_uci(cleaned.lower())
         if uci_move in board.legal_moves:
@@ -247,15 +275,8 @@ def parse_player_move(board: chess.Board, text: str) -> chess.Move:
 
 
 def load_game_from_notation(notation_text: str, current_skill_level: int):
-    """
-    Rebuilds game state and board from a raw SAN move list or PGN sequence.
-    Example inputs:
-      - 'e4 e5 Nf3 Nc6 Bc4'
-      - '1. e4 e5 2. Nf3 Nc6 3. Bc4'
-      - 'e4, e5, Nf3, Nc6'
-    """
+    """Rebuilds game state and board from a raw SAN move list or PGN sequence."""
     raw = notation_text.replace(",", " ")
-    # Filter out turn numbering (1., 2...), annotations ($1, ?!), and result markers
     tokens = re.split(r"\s+", raw.strip())
     valid_tokens = [
         t for t in tokens
@@ -266,7 +287,6 @@ def load_game_from_notation(notation_text: str, current_skill_level: int):
     new_history = []
 
     for idx, token in enumerate(valid_tokens):
-        # Strip trailing move numbers if formatted like '1.e4'
         token = re.sub(r"^\d+\.+", "", token).strip()
         if not token:
             continue
@@ -274,19 +294,16 @@ def load_game_from_notation(notation_text: str, current_skill_level: int):
             move = parse_player_move(temp_board, token)
             san_str = temp_board.san(move)
             temp_board.push(move)
-            # Human moves are at even indices (0, 2, ...), AI moves at odd indices (1, 3, ...)
             verdict = "AI" if idx % 2 != 0 else ""
             new_history.append({"san": san_str, "verdict": verdict})
         except Exception:
             return False, f"Illegal or unrecognized move '{token}' at position {idx + 1}."
 
-    # Update state with restored board
     st.session_state.board = temp_board
     st.session_state.move_history = new_history
     st.session_state.game_saved = False
     st.session_state.messages = []
 
-    # If the imported notation ended on White's turn (player's move), have Stockfish counter-move
     if temp_board.turn == chess.BLACK and not temp_board.is_game_over():
         ai_san = execute_ai_move(st.session_state.board, current_skill_level)
         if ai_san:
@@ -308,7 +325,9 @@ def init_session_state():
         st.session_state.board = chess.Board()
         st.session_state.move_history = []
         st.session_state.coach_text = "Welcome! Make a move to start the session."
-        st.session_state.messages = []
+        st.session_state.messages = [
+            {"role": "assistant", "content": "Hello! I am your coach. Play a move, or ask me anything about chess strategy or the current position."}
+        ]
         st.session_state.player_name = ""
         st.session_state.game_saved = False
 
@@ -318,7 +337,9 @@ def reset_game():
     st.session_state.board = chess.Board()
     st.session_state.move_history = []
     st.session_state.coach_text = "Welcome! Make a move to start the session."
-    st.session_state.messages = []
+    st.session_state.messages = [
+        {"role": "assistant", "content": "New game started! What would you like to open with?"}
+    ]
     st.session_state.game_saved = False
     st.rerun()
 
@@ -448,9 +469,9 @@ def main():
 
                         st.rerun()
                     else:
-                        error_placeholder.error("Illegal move!")
+                        error_placeholder.error("Illegal move under current board rules!")
                 except ValueError:
-                    error_placeholder.error("Invalid notation! Use e4, Nf3, etc.")
+                    error_placeholder.error("Invalid move! Use SAN (e.g., e4, Nf3, O-O) or squares (e1g1).")
 
     with col2:
         st.subheader("Coach's Corner")
@@ -472,24 +493,22 @@ def main():
 
         st.markdown(
             f"""
-            <div style="background-color: {bg_color}; padding: 20px; border-radius: 10px; 
-            border-left: 5px solid rgba(0,0,0,0.1); color: #000000; font-size: 16px; line-height: 1.6;">
+            <div style="background-color: {bg_color}; padding: 16px; border-radius: 8px; 
+            border-left: 5px solid rgba(0,0,0,0.1); color: #000000; font-size: 15px; line-height: 1.5; margin-bottom: 12px;">
                 {st.session_state.coach_text}
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        # -----------------------------------------------------------------
-        # Snapshot / Game Restore Placeholder (Below Coach's Corner)
-        # -----------------------------------------------------------------
+        # Snapshot / Game Restore Placeholder
         with st.expander("Resume Game from Snapshot Notation", expanded=False):
             st.caption("Paste full PGN or moves (e.g., `1. e4 e5 2. Nf3 Nc6` or `e4 e5 Nf3 Nc6`).")
             snapshot_input = st.text_area(
                 "Game Notation:",
                 placeholder="1. e4 e5 2. Nf3 Nc6 3. Bc4",
                 key="snapshot_notation_input",
-                height=100
+                height=80
             )
             if st.button("Load Snapshot & Continue"):
                 if not st.session_state.player_name:
@@ -504,40 +523,31 @@ def main():
                     else:
                         st.error(msg)
 
-        # Chat interaction
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+        # -------------------------------------------------------------
+        # Interactive Multi-Turn Chat with Coach
+        # -------------------------------------------------------------
+        st.markdown("#### Conversation with Coach")
+        chat_container = st.container(height=320)
+        with chat_container:
+            for message in st.session_state.messages:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
 
-        if user_query := st.chat_input("Ask your coach about the position..."):
+        if user_query := st.chat_input("Ask your coach about strategy, mistakes, or plans..."):
+            # 1. Append player question
             st.session_state.messages.append({"role": "user", "content": user_query})
-            with st.chat_message("user"):
-                st.markdown(user_query)
 
-            with st.chat_message("assistant"):
-                with st.spinner("Coach is thinking..."):
-                    current_moves = ", ".join([m["san"] for m in st.session_state.move_history])
-                    system_prompt = (
-                        f"You are a helpful chess coach. Current game moves: {current_moves}. "
-                        "Answer the player's questions clearly based on the board."
-                    )
+            # 2. Query LLM with full context
+            with st.spinner("Coach is thinking..."):
+                reply = get_conversational_coach_reply(
+                    st.session_state.board,
+                    st.session_state.move_history,
+                    st.session_state.messages
+                )
+                st.session_state.messages.append({"role": "assistant", "content": reply})
 
-                    chat_history = []
-                    for m in st.session_state.messages:
-                        if m["role"] == "user":
-                            chat_history.append(HumanMessage(content=m["content"]))
-                        elif m["role"] == "assistant":
-                            chat_history.append(AIMessage(content=m["content"]))
-
-                    messages = [SystemMessage(content=system_prompt)] + chat_history
-                    try:
-                        response = CHAT_MODEL.invoke(messages)
-                        coach_reply = response.content
-                    except Exception as e:
-                        coach_reply = f"Error communicating with AI: {e}"
-
-                    st.markdown(coach_reply)
-                    st.session_state.messages.append({"role": "assistant", "content": coach_reply})
+            # 3. Refresh display smoothly
+            st.rerun()
 
         if st.button("Restart Game"):
             reset_game()
