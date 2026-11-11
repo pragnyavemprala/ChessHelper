@@ -2,7 +2,10 @@ import os
 import re
 import uuid
 import base64
+import time
+import threading
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -37,6 +40,9 @@ def load_config():
 
 CONFIG = load_config()
 
+# Thread pool for asynchronous coach analysis
+ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+
 
 # ==========================================
 # 2. Database Layer (DynamoDB)
@@ -58,9 +64,7 @@ def get_dynamo_table():
 
 
 def get_player_stats(player_name: str):
-    """
-    Queries DynamoDB for player records and calculates win/total games.
-    """
+    """Queries DynamoDB for player records and calculates win/total games."""
     table = get_dynamo_table()
     if not table or not player_name:
         return {"total_games": 0, "wins": 0, "is_new": True}
@@ -81,9 +85,7 @@ def get_player_stats(player_name: str):
 
 
 def save_game_record(player_name: str, status: str, history: list, summary: str):
-    """
-    Saves the full game details to DynamoDB upon game completion.
-    """
+    """Saves the full game details to DynamoDB upon game completion."""
     table = get_dynamo_table()
     if not table or not player_name:
         return False
@@ -141,8 +143,19 @@ CHAT_MODEL, STOCKFISH = load_assets()
 
 
 # ==========================================
-# 4. Chess & Coach Logic
+# 4. Chess, Clock & Coach Logic
 # ==========================================
+TIME_CONTROLS = {
+    "Bullet (1+0)": (60, 0),
+    "Blitz (3+2)": (180, 2),
+    "Blitz (5+3)": (300, 3),
+    "Rapid (10+0)": (600, 0),
+    "Rapid (15+10)": (900, 10),
+    "Classical (25+5)": (1500, 5),
+    "Unlimited": (None, 0),
+}
+
+
 def render_board(board):
     """Renders the chess board SVG as HTML."""
     last_move = board.peek() if board.move_stack else None
@@ -151,29 +164,40 @@ def render_board(board):
     return f'<img src="data:image/svg+xml;base64,{b64}"/>'
 
 
-def get_coach_analysis(move_history):
-    """Provides short tactical move feedback for the banner."""
-    if not move_history:
-        return ""
-    moves_str = ", ".join([m["san"] for m in move_history])
-    system_text = CONFIG["coach_prompt"].replace("{moves_str}", moves_str)
-
-    messages = [
-        SystemMessage(content=system_text),
-        HumanMessage(content=f"Current move history: {moves_str}. Analyze the last move played."),
-    ]
+def background_analyze_move(move_history_snapshot):
+    """Runs asynchronously in background thread to analyze the latest move."""
     try:
+        if not move_history_snapshot:
+            return
+        moves_str = ", ".join([m["san"] for m in move_history_snapshot])
+        system_text = CONFIG["coach_prompt"].replace("{moves_str}", moves_str)
+
+        messages = [
+            SystemMessage(content=system_text),
+            HumanMessage(content=f"Current move history: {moves_str}. Analyze the last move played."),
+        ]
         response = CHAT_MODEL.invoke(messages)
-        return response.content
+        analysis = response.content
+        
+        # Determine verdict
+        verdict = ""
+        for category in ["[GOOD]", "[INACCURACY]", "[MISTAKE]", "[BLUNDER]"]:
+            if category in analysis.upper():
+                verdict = category
+                break
+
+        # Safely update session state state
+        st.session_state.coach_text = analysis
+        if st.session_state.move_history:
+            st.session_state.move_history[-1]["verdict"] = verdict
+        st.session_state.is_analyzing = False
     except Exception as e:
-        return f"Coach is currently offline: {e}"
+        st.session_state.coach_text = f"Coach analysis unavailable: {e}"
+        st.session_state.is_analyzing = False
 
 
 def get_conversational_coach_reply(board, move_history, chat_messages):
-    """
-    Carries out a continuous conversational dialog with the coach.
-    Preserves prior chat history and provides current board state/history context.
-    """
+    """Carries out a continuous conversational dialog with the coach."""
     moves_str = ", ".join([m["san"] for m in move_history]) if move_history else "No moves made yet"
     turn_str = "White" if board.turn == chess.WHITE else "Black"
     
@@ -217,22 +241,13 @@ def generate_game_summary(move_history, result_text):
         return "Game concluded."
 
 
-def evaluate_verdict(analysis_text: str) -> str:
-    """Parses coach analysis for classification tags."""
-    for category in ["[GOOD]", "[INACCURACY]", "[MISTAKE]", "[BLUNDER]"]:
-        if category in analysis_text.upper():
-            return category
-    return ""
-
-
 def execute_ai_move(board, skill_level):
-    """Executes a Stockfish counter-move."""
+    """Executes a Stockfish counter-move immediately."""
     if not STOCKFISH or board.is_game_over():
         return None
     STOCKFISH.set_skill_level(skill_level)
     STOCKFISH.set_fen_position(board.fen())
-    think_time = 100 + (skill_level * 50)
-    best_move_uci = STOCKFISH.get_best_move_time(think_time)
+    best_move_uci = STOCKFISH.get_best_move_time(50) # Instantaneous AI response
 
     if best_move_uci:
         ai_move = chess.Move.from_uci(best_move_uci)
@@ -243,19 +258,11 @@ def execute_ai_move(board, skill_level):
 
 
 def parse_player_move(board: chess.Board, text: str) -> chess.Move:
-    """
-    Parses user input into a valid chess.Move.
-    Accepts standard SAN, common castling variants (0-0, o-o), and UCI moves (e1g1).
-    """
+    """Parses user input into a valid chess.Move."""
     cleaned = text.strip()
-
     castling_map = {
-        "0-0-0": "O-O-O",
-        "o-o-o": "O-O-O",
-        "ooo": "O-O-O",
-        "0-0": "O-O",
-        "o-o": "O-O",
-        "oo": "O-O",
+        "0-0-0": "O-O-O", "o-o-o": "O-O-O", "ooo": "O-O-O",
+        "0-0": "O-O", "o-o": "O-O", "oo": "O-O",
     }
     cleaned = castling_map.get(cleaned.lower(), cleaned)
 
@@ -274,48 +281,6 @@ def parse_player_move(board: chess.Board, text: str) -> chess.Move:
     raise ValueError(f"'{text}' is not recognized as a legal SAN or UCI move.")
 
 
-def load_game_from_notation(notation_text: str, current_skill_level: int):
-    """Rebuilds game state and board from a raw SAN move list or PGN sequence."""
-    raw = notation_text.replace(",", " ")
-    tokens = re.split(r"\s+", raw.strip())
-    valid_tokens = [
-        t for t in tokens
-        if t and not re.match(r"^\d+\.+$", t) and t not in ["1-0", "0-1", "1/2-1/2", "*"]
-    ]
-
-    temp_board = chess.Board()
-    new_history = []
-
-    for idx, token in enumerate(valid_tokens):
-        token = re.sub(r"^\d+\.+", "", token).strip()
-        if not token:
-            continue
-        try:
-            move = parse_player_move(temp_board, token)
-            san_str = temp_board.san(move)
-            temp_board.push(move)
-            verdict = "AI" if idx % 2 != 0 else ""
-            new_history.append({"san": san_str, "verdict": verdict})
-        except Exception:
-            return False, f"Illegal or unrecognized move '{token}' at position {idx + 1}."
-
-    st.session_state.board = temp_board
-    st.session_state.move_history = new_history
-    st.session_state.game_saved = False
-    st.session_state.messages = []
-
-    if temp_board.turn == chess.BLACK and not temp_board.is_game_over():
-        ai_san = execute_ai_move(st.session_state.board, current_skill_level)
-        if ai_san:
-            st.session_state.move_history.append({"san": ai_san, "verdict": "AI"})
-
-    st.session_state.coach_text = (
-        f"Game restored to move {len(new_history)}. "
-        f"{'White' if st.session_state.board.turn == chess.WHITE else 'Black'} to move."
-    )
-    return True, "Game position successfully loaded!"
-
-
 # ==========================================
 # 5. Session State Management
 # ==========================================
@@ -326,41 +291,55 @@ def init_session_state():
         st.session_state.move_history = []
         st.session_state.coach_text = "Welcome! Make a move to start the session."
         st.session_state.messages = [
-            {"role": "assistant", "content": "Hello! I am your coach. Play a move, or ask me anything about chess strategy or the current position."}
+            {"role": "assistant", "content": "Hello! I am your coach. Play a move, or ask me anything about chess strategy."}
         ]
         st.session_state.player_name = ""
         st.session_state.game_saved = False
+        st.session_state.is_analyzing = False
+        st.session_state.time_control_key = "Classical (25+5)"
+        base_time, _ = TIME_CONTROLS["Classical (25+5)"]
+        st.session_state.white_time = base_time
+        st.session_state.black_time = base_time
+        st.session_state.last_move_time = time.time()
 
 
-def reset_game():
-    """Resets board and in-game states while keeping player profile."""
+def reset_game(time_control_name):
+    """Resets board and time controls."""
     st.session_state.board = chess.Board()
     st.session_state.move_history = []
-    st.session_state.coach_text = "Welcome! Make a move to start the session."
+    st.session_state.coach_text = "New game started! Make your opening move."
     st.session_state.messages = [
         {"role": "assistant", "content": "New game started! What would you like to open with?"}
     ]
     st.session_state.game_saved = False
+    st.session_state.is_analyzing = False
+    
+    base_time, _ = TIME_CONTROLS.get(time_control_name, (None, 0))
+    st.session_state.white_time = base_time
+    st.session_state.black_time = base_time
+    st.session_state.last_move_time = time.time()
     st.rerun()
 
 
 # ==========================================
-# 6. UI Components
+# 6. UI Components & Main App
 # ==========================================
-def render_player_header():
-    """Renders player registration input and displays win statistics."""
+def main():
+    st.set_page_config(page_title="AI Chess Coach with Clocks", layout="wide")
+    init_session_state()
+
+    # --- Sidebar Configuration ---
     st.sidebar.header("Player Profile")
     player_input = st.sidebar.text_input(
         "Enter Player Name:",
         value=st.session_state.player_name,
         placeholder="e.g. Kasparov",
     )
-
     if player_input:
         st.session_state.player_name = player_input
         stats = get_player_stats(player_input)
         if stats["is_new"]:
-            st.sidebar.info(f"Welcome, **{player_input}**! You are registered as a new player.")
+            st.sidebar.info(f"Welcome, **{player_input}**! New player registered.")
         else:
             win_rate = (stats["wins"] / stats["total_games"] * 100) if stats["total_games"] else 0
             st.sidebar.success(
@@ -369,65 +348,22 @@ def render_player_header():
                 f"- Win Rate: **{win_rate:.1f}%**"
             )
     else:
-        st.sidebar.warning("Please enter your name to track game progress.")
+        st.sidebar.warning("Please enter your name to track game stats.")
 
-
-def render_sidebar_history():
-    """Renders move list in reverse chronological order."""
     st.sidebar.markdown("---")
-    st.sidebar.subheader("Move History")
-
-    history = st.session_state.move_history
-    pairs = []
-    for i in range(0, len(history), 2):
-        move_num = (i // 2) + 1
-        w_data = history[i]
-        b_data = history[i + 1] if i + 1 < len(history) else {"san": "...", "verdict": "AI"}
-        pairs.append((move_num, w_data, b_data))
-
-    for m_num, w, b in reversed(pairs):
-        w_verdict = f" `{w['verdict']}`" if w["verdict"] else ""
-        st.sidebar.markdown(f"**{m_num}.** {w['san']}{w_verdict} &nbsp;&nbsp; {b['san']}")
-
-
-def handle_game_completion():
-    """Handles end-of-game checks and triggers DynamoDB record write once."""
-    if not st.session_state.board.is_game_over():
-        return
-
-    result = st.session_state.board.result()
-    if result == "1-0":
-        status = "Player Won"
-    elif result == "0-1":
-        status = "AI Won"
-    else:
-        status = "Draw"
-
-    st.success(f"Game Over! Result: {result} ({status})")
-
-    if not st.session_state.game_saved:
-        with st.spinner("Generating match summary and saving to DynamoDB..."):
-            summary = generate_game_summary(st.session_state.move_history, status)
-            if st.session_state.player_name:
-                saved = save_game_record(
-                    st.session_state.player_name,
-                    status,
-                    st.session_state.move_history,
-                    summary,
-                )
-                if saved:
-                    st.toast("Game outcome recorded in DynamoDB!")
-            st.session_state.game_saved = True
-
-
-# ==========================================
-# 7. Main Application Flow
-# ==========================================
-def main():
-    st.set_page_config(page_title="AI Chess Coach", layout="wide")
-    init_session_state()
-
-    render_player_header()
+    st.sidebar.header("Game Settings")
+    
+    selected_tc = st.sidebar.selectbox(
+        "Time Control",
+        options=list(TIME_CONTROLS.keys()),
+        index=list(TIME_CONTROLS.keys()).index(st.session_state.time_control_key)
+    )
+    if selected_tc != st.session_state.time_control_key:
+        st.session_state.time_control_key = selected_tc
+        base_time, _ = TIME_CONTROLS[selected_tc]
+        st.session_state.white_time = base_time
+        st.session_state.black_time = base_time
+        st.session_state.last_move_time = time.time()
 
     current_skill_level = st.sidebar.slider(
         "AI Difficulty (Skill Level)",
@@ -437,41 +373,74 @@ def main():
         help="1 is easiest, 20 is Grandmaster level.",
     )
 
+    if st.sidebar.button("Restart / New Game"):
+        reset_game(selected_tc)
+
+    # --- Clock Management & Timeouts ---
+    base_time, increment = TIME_CONTROLS[st.session_state.time_control_key]
+    if base_time is not None and not st.session_state.board.is_game_over():
+        elapsed = time.time() - st.session_state.last_move_time
+        if st.session_state.board.turn == chess.WHITE:
+            st.session_state.white_time = max(0, st.session_state.white_time - elapsed)
+            if st.session_state.white_time == 0:
+                st.session_state.board.clear() # Flagged out
+        st.session_state.last_move_time = time.time()
+
+    # --- Main Layout ---
     col1, col2 = st.columns([3, 2])
 
     with col1:
+        # Display Clocks
+        if base_time is not None:
+            w_min, w_sec = divmod(int(st.session_state.white_time), 60)
+            b_min, b_sec = divmod(int(st.session_state.black_time), 60)
+            col_clock1, col_clock2 = st.columns(2)
+            col_clock1.metric("⏱️ White (You)", f"{w_min:02d}:{w_sec:02d}")
+            col_clock2.metric("⏱️ Black (AI)", f"{b_min:02d}:{b_sec:02d}")
+
         error_placeholder = st.empty()
         st.write(render_board(st.session_state.board), unsafe_allow_html=True)
 
-        with st.form(key="chess_move_form", clear_on_submit=True):
-            move_input = st.text_input("Enter Move (SAN notation, e.g., e4, Nf3, O-O):")
-            submit_button = st.form_submit_button("Play Move")
+        if not st.session_state.board.is_game_over() and st.session_state.white_time != 0:
+            with st.form(key="chess_move_form", clear_on_submit=True):
+                move_input = st.text_input("Enter Move (SAN notation e.g., e4, Nf3, O-O):")
+                submit_button = st.form_submit_button("Play Move")
 
-        if submit_button and move_input:
-            if not st.session_state.player_name:
-                error_placeholder.warning("Please enter your player name in the sidebar before moving.")
+            if submit_button and move_input:
+                if not st.session_state.player_name:
+                    error_placeholder.warning("Please enter your player name in the sidebar before moving.")
+                else:
+                    try:
+                        move = parse_player_move(st.session_state.board, move_input)
+                        if move in st.session_state.board.legal_moves:
+                            # Apply time increment if applicable
+                            if base_time is not None:
+                                st.session_state.white_time += increment
+
+                            san_move = st.session_state.board.san(move)
+                            st.session_state.board.push(move)
+                            st.session_state.move_history.append({"san": san_move, "verdict": "Analyzing..."})
+
+                            # Trigger asynchronous background coach analysis
+                            st.session_state.is_analyzing = True
+                            ANALYSIS_EXECUTOR.submit(background_analyze_move, list(st.session_state.move_history))
+
+                            # Execute immediate AI counter-move
+                            if not st.session_state.board.is_game_over():
+                                ai_san = execute_ai_move(st.session_state.board, current_skill_level)
+                                if ai_san:
+                                    st.session_state.move_history.append({"san": ai_san, "verdict": "AI"})
+
+                            st.rerun()
+                        else:
+                            error_placeholder.error("Illegal move under current board rules!")
+                    except ValueError:
+                        error_placeholder.error("Invalid move! Use SAN (e.g., e4, Nf3, O-O) or squares (e1g1).")
+        else:
+            if st.session_state.white_time == 0:
+                st.error("Time out! You lost on time.")
             else:
-                try:
-                    move = parse_player_move(st.session_state.board, move_input)
-                    if move in st.session_state.board.legal_moves:
-                        san_move = st.session_state.board.san(move)
-                        st.session_state.board.push(move)
-                        st.session_state.move_history.append({"san": san_move, "verdict": ""})
-
-                        with st.spinner("Grandmaster is analyzing your move..."):
-                            analysis = get_coach_analysis(st.session_state.move_history)
-                            st.session_state.coach_text = analysis
-                            st.session_state.move_history[-1]["verdict"] = evaluate_verdict(analysis)
-
-                        ai_san = execute_ai_move(st.session_state.board, current_skill_level)
-                        if ai_san:
-                            st.session_state.move_history.append({"san": ai_san, "verdict": "AI"})
-
-                        st.rerun()
-                    else:
-                        error_placeholder.error("Illegal move under current board rules!")
-                except ValueError:
-                    error_placeholder.error("Invalid move! Use SAN (e.g., e4, Nf3, O-O) or squares (e1g1).")
+                st.info("Game Over.")
 
     with col2:
         st.subheader("Coach's Corner")
@@ -479,83 +448,4 @@ def main():
         bg_color = "#f0f2f6"
         if st.session_state.move_history:
             history_len = len(st.session_state.move_history)
-            target_idx = history_len - 1 if history_len % 2 != 0 else history_len - 2
-            if target_idx >= 0:
-                latest_verdict = st.session_state.move_history[target_idx].get("verdict", "").upper()
-                if "[GOOD]" in latest_verdict:
-                    bg_color = "#d4edda"
-                elif "[INACCURACY]" in latest_verdict:
-                    bg_color = "#fff3cd"
-                elif "[MISTAKE]" in latest_verdict:
-                    bg_color = "#ffe5d0"
-                elif "[BLUNDER]" in latest_verdict:
-                    bg_color = "#f8d7da"
-
-        st.markdown(
-            f"""
-            <div style="background-color: {bg_color}; padding: 16px; border-radius: 8px; 
-            border-left: 5px solid rgba(0,0,0,0.1); color: #000000; font-size: 15px; line-height: 1.5; margin-bottom: 12px;">
-                {st.session_state.coach_text}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        # Snapshot / Game Restore Placeholder
-        with st.expander("Resume Game from Snapshot Notation", expanded=False):
-            st.caption("Paste full PGN or moves (e.g., `1. e4 e5 2. Nf3 Nc6` or `e4 e5 Nf3 Nc6`).")
-            snapshot_input = st.text_area(
-                "Game Notation:",
-                placeholder="1. e4 e5 2. Nf3 Nc6 3. Bc4",
-                key="snapshot_notation_input",
-                height=80
-            )
-            if st.button("Load Snapshot & Continue"):
-                if not st.session_state.player_name:
-                    st.warning("Please enter your player name in the sidebar before restoring.")
-                elif not snapshot_input.strip():
-                    st.warning("Please paste valid game notation.")
-                else:
-                    success, msg = load_game_from_notation(snapshot_input, current_skill_level)
-                    if success:
-                        st.toast(msg, icon="♟️")
-                        st.rerun()
-                    else:
-                        st.error(msg)
-
-        # -------------------------------------------------------------
-        # Interactive Multi-Turn Chat with Coach
-        # -------------------------------------------------------------
-        st.markdown("#### Conversation with Coach")
-        chat_container = st.container(height=320)
-        with chat_container:
-            for message in st.session_state.messages:
-                with st.chat_message(message["role"]):
-                    st.markdown(message["content"])
-
-        if user_query := st.chat_input("Ask your coach about strategy, mistakes, or plans..."):
-            # 1. Append player question
-            st.session_state.messages.append({"role": "user", "content": user_query})
-
-            # 2. Query LLM with full context
-            with st.spinner("Coach is thinking..."):
-                reply = get_conversational_coach_reply(
-                    st.session_state.board,
-                    st.session_state.move_history,
-                    st.session_state.messages
-                )
-                st.session_state.messages.append({"role": "assistant", "content": reply})
-
-            # 3. Refresh display smoothly
-            st.rerun()
-
-        if st.button("Restart Game"):
-            reset_game()
-
-        handle_game_completion()
-
-    render_sidebar_history()
-
-
-if __name__ == "__main__":
-    main()
+            target_idx = history_len - 1 if history_len
