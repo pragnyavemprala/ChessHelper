@@ -151,8 +151,7 @@ TIME_CONTROLS = {
     "Blitz (5+3)": (300, 3),
     "Rapid (10+0)": (600, 0),
     "Rapid (15+10)": (900, 10),
-    "Classical (25+5)": (1500, 5),
-    "Unlimited": (None, 0),
+    "Classical (25+5)": (1500, 5)
 }
 
 
