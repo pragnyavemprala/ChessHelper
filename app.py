@@ -151,7 +151,8 @@ TIME_CONTROLS = {
     "Blitz (5+3)": (300, 3),
     "Rapid (10+0)": (600, 0),
     "Rapid (15+10)": (900, 10),
-    "Classical (25+5)": (1500, 5)
+    "Classical (25+5)": (1500, 5),
+    "Unlimited": (None, 0),
 }
 
 
@@ -447,4 +448,103 @@ def main():
         bg_color = "#f0f2f6"
         if st.session_state.move_history:
             history_len = len(st.session_state.move_history)
-            target_idx = history_len - 1 if history_len
+            target_idx = history_len - 1 if history_len % 2 != 0 else history_len - 2
+            if target_idx >= 0:
+                latest_verdict = st.session_state.move_history[target_idx].get("verdict", "").upper()
+                if "[GOOD]" in latest_verdict:
+                    bg_color = "#d4edda"
+                elif "[INACCURACY]" in latest_verdict:
+                    bg_color = "#fff3cd"
+                elif "[MISTAKE]" in latest_verdict:
+                    bg_color = "#ffe5d0"
+                elif "[BLUNDER]" in latest_verdict:
+                    bg_color = "#f8d7da"
+
+        # Show analysis box with status indicator if background thread is running
+        analysis_display = st.session_state.coach_text
+        if st.session_state.is_analyzing:
+            analysis_display += "\n\n*⏳ Grandmaster is reviewing your move in the background...*"
+
+        st.markdown(
+            f"""
+            <div style="background-color: {bg_color}; padding: 16px; border-radius: 8px; 
+            border-left: 5px solid rgba(0,0,0,0.1); color: #000000; font-size: 15px; line-height: 1.5; margin-bottom: 12px;">
+                {analysis_display.replace(chr(10), '<br>')}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Interactive Chat with Coach
+        st.markdown("#### Conversation with Coach")
+        chat_container = st.container(height=320)
+        with chat_container:
+            for message in st.session_state.messages:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+
+        if user_query := st.chat_input("Ask your coach about strategy, mistakes, or plans..."):
+            st.session_state.messages.append({"role": "user", "content": user_query})
+            with st.spinner("Coach is thinking..."):
+                reply = get_conversational_coach_reply(
+                    st.session_state.board,
+                    st.session_state.move_history,
+                    st.session_state.messages
+                )
+                st.session_state.messages.append({"role": "assistant", "content": reply})
+            st.rerun()
+
+        handle_game_completion()
+
+    # --- Sidebar Move History ---
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Move History")
+    history = st.session_state.move_history
+    pairs = []
+    for i in range(0, len(history), 2):
+        move_num = (i // 2) + 1
+        w_data = history[i]
+        b_data = history[i + 1] if i + 1 < len(history) else {"san": "...", "verdict": "AI"}
+        pairs.append((move_num, w_data, b_data))
+
+    for m_num, w, b in reversed(pairs):
+        w_verdict = f" `{w['verdict']}`" if w["verdict"] and w["verdict"] != "Analyzing..." else ""
+        st.sidebar.markdown(f"**{m_num}.** {w['san']}{w_verdict} &nbsp;&nbsp; {b['san']}")
+
+
+def handle_game_completion():
+    """Handles end-of-game checks and triggers DynamoDB record write once."""
+    if not st.session_state.board.is_game_over() and st.session_state.white_time != 0:
+        return
+
+    if st.session_state.white_time == 0:
+        result = "0-1"
+        status = "AI Won"
+    else:
+        result = st.session_state.board.result()
+        if result == "1-0":
+            status = "Player Won"
+        elif result == "0-1":
+            status = "AI Won"
+        else:
+            status = "Draw"
+
+    st.success(f"Game Over! Result: {result} ({status})")
+
+    if not st.session_state.game_saved:
+        with st.spinner("Saving match summary to DynamoDB..."):
+            summary = generate_game_summary(st.session_state.move_history, status)
+            if st.session_state.player_name:
+                saved = save_game_record(
+                    st.session_state.player_name,
+                    status,
+                    st.session_state.move_history,
+                    summary,
+                )
+                if saved:
+                    st.toast("Game outcome recorded in DynamoDB!")
+            st.session_state.game_saved = True
+
+
+if __name__ == "__main__":
+    main()
