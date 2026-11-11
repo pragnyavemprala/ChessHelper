@@ -164,11 +164,11 @@ def render_board(board):
     return f'<img src="data:image/svg+xml;base64,{b64}"/>'
 
 
-def background_analyze_move(move_history_snapshot):
-    """Runs asynchronously in background thread to analyze the latest move."""
+def analyze_move_task(move_history_snapshot):
+    """Runs in background thread and returns the result safely."""
     try:
         if not move_history_snapshot:
-            return
+            return None, ""
         moves_str = ", ".join([m["san"] for m in move_history_snapshot])
         system_text = CONFIG["coach_prompt"].replace("{moves_str}", moves_str)
 
@@ -179,21 +179,15 @@ def background_analyze_move(move_history_snapshot):
         response = CHAT_MODEL.invoke(messages)
         analysis = response.content
         
-        # Determine verdict
         verdict = ""
         for category in ["[GOOD]", "[INACCURACY]", "[MISTAKE]", "[BLUNDER]"]:
             if category in analysis.upper():
                 verdict = category
                 break
 
-        # Safely update session state state
-        st.session_state.coach_text = analysis
-        if st.session_state.move_history:
-            st.session_state.move_history[-1]["verdict"] = verdict
-        st.session_state.is_analyzing = False
+        return analysis, verdict
     except Exception as e:
-        st.session_state.coach_text = f"Coach analysis unavailable: {e}"
-        st.session_state.is_analyzing = False
+        return f"Coach analysis unavailable: {e}", ""
 
 
 def get_conversational_coach_reply(board, move_history, chat_messages):
@@ -422,8 +416,9 @@ def main():
                             st.session_state.move_history.append({"san": san_move, "verdict": "Analyzing..."})
 
                             # Trigger asynchronous background coach analysis
+                            # Inside move submit logic:
                             st.session_state.is_analyzing = True
-                            ANALYSIS_EXECUTOR.submit(background_analyze_move, list(st.session_state.move_history))
+                            st.session_state.analysis_future = ANALYSIS_EXECUTOR.submit(analyze_move_task, list(st.session_state.move_history))
 
                             # Execute immediate AI counter-move
                             if not st.session_state.board.is_game_over():
@@ -446,34 +441,44 @@ def main():
         st.subheader("Coach's Corner")
 
         bg_color = "#f0f2f6"
-        if st.session_state.move_history:
-            history_len = len(st.session_state.move_history)
-            target_idx = history_len - 1 if history_len % 2 != 0 else history_len - 2
-            if target_idx >= 0:
-                latest_verdict = st.session_state.move_history[target_idx].get("verdict", "").upper()
-                if "[GOOD]" in latest_verdict:
-                    bg_color = "#d4edda"
-                elif "[INACCURACY]" in latest_verdict:
-                    bg_color = "#fff3cd"
-                elif "[MISTAKE]" in latest_verdict:
-                    bg_color = "#ffe5d0"
-                elif "[BLUNDER]" in latest_verdict:
-                    bg_color = "#f8d7da"
+        # Define an auto-refreshing fragment when analysis is pending
+        @st.fragment(run_every=2.0 if st.session_state.is_analyzing else None)
+        def render_coach_corner():
+            # Check if the background task has completed
+            if "analysis_future" in st.session_state and st.session_state.analysis_future.done():
+                analysis, verdict = st.session_state.analysis_future.result()
+                st.session_state.coach_text = analysis
+                if st.session_state.move_history:
+                    st.session_state.move_history[-1]["verdict"] = verdict
+                st.session_state.is_analyzing = False
+                del st.session_state["analysis_future"]
 
-        # Show analysis box with status indicator if background thread is running
-        analysis_display = st.session_state.coach_text
-        if st.session_state.is_analyzing:
-            analysis_display += "\n\n*⏳ Grandmaster is reviewing your move in the background...*"
+            bg_color = "#f0f2f6"
+            if st.session_state.move_history:
+                history_len = len(st.session_state.move_history)
+                target_idx = history_len - 1 if history_len % 2 != 0 else history_len - 2
+                if target_idx >= 0:
+                    latest_verdict = st.session_state.move_history[target_idx].get("verdict", "").upper()
+                    if "[GOOD]" in latest_verdict: bg_color = "#d4edda"
+                    elif "[INACCURACY]" in latest_verdict: bg_color = "#fff3cd"
+                    elif "[MISTAKE]" in latest_verdict: bg_color = "#ffe5d0"
+                    elif "[BLUNDER]" in latest_verdict: bg_color = "#f8d7da"
 
-        st.markdown(
-            f"""
-            <div style="background-color: {bg_color}; padding: 16px; border-radius: 8px; 
-            border-left: 5px solid rgba(0,0,0,0.1); color: #000000; font-size: 15px; line-height: 1.5; margin-bottom: 12px;">
-                {analysis_display.replace(chr(10), '<br>')}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+            analysis_display = st.session_state.coach_text
+            if st.session_state.is_analyzing:
+                analysis_display += "\n\n*⏳ Grandmaster is reviewing your move in the background...*"
+
+            st.markdown(
+                f"""
+                <div style="background-color: {bg_color}; padding: 16px; border-radius: 8px; 
+                border-left: 5px solid rgba(0,0,0,0.1); color: #000000; font-size: 15px; line-height: 1.5; margin-bottom: 12px;">
+                    {analysis_display.replace(chr(10), '<br>')}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        render_coach_corner()
 
         # Interactive Chat with Coach
         st.markdown("#### Conversation with Coach")
