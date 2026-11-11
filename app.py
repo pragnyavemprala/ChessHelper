@@ -390,7 +390,7 @@ def main():
             b_min, b_sec = divmod(int(st.session_state.black_time), 60)
             col_clock1, col_clock2 = st.columns(2)
             col_clock1.metric("⏱️ White (You)", f"{w_min:02d}:{w_sec:02d}")
-            col_clock2.metric("⏱️ Black (AI)", f"{b_min:02d}:{b_sec:02d}")
+            #col_clock2.metric("⏱️ Black (AI)", f"{b_min:02d}:{b_sec:02d}")
 
         error_placeholder = st.empty()
         st.write(render_board(st.session_state.board), unsafe_allow_html=True)
