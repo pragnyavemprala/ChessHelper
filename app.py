@@ -3,7 +3,6 @@ import re
 import uuid
 import base64
 import time
-import threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
@@ -151,7 +150,8 @@ TIME_CONTROLS = {
     "Blitz (5+3)": (300, 3),
     "Rapid (10+0)": (600, 0),
     "Rapid (15+10)": (900, 10),
-    "Classical (25+5)": (1500, 5)
+    "Classical (25+5)": (1500, 5),
+    "Unlimited": (None, 0),
 }
 
 
@@ -177,7 +177,7 @@ def analyze_move_task(move_history_snapshot):
         ]
         response = CHAT_MODEL.invoke(messages)
         analysis = response.content
-        
+
         verdict = ""
         for category in ["[GOOD]", "[INACCURACY]", "[MISTAKE]", "[BLUNDER]"]:
             if category in analysis.upper():
@@ -193,7 +193,7 @@ def get_conversational_coach_reply(board, move_history, chat_messages):
     """Carries out a continuous conversational dialog with the coach."""
     moves_str = ", ".join([m["san"] for m in move_history]) if move_history else "No moves made yet"
     turn_str = "White" if board.turn == chess.WHITE else "Black"
-    
+
     system_instructions = (
         "You are an encouraging, insightful International Chess Grandmaster acting as a personal coach. "
         "The player is playing as White against Stockfish (Black). Maintain an interactive, conversational tone. "
@@ -240,7 +240,7 @@ def execute_ai_move(board, skill_level):
         return None
     STOCKFISH.set_skill_level(skill_level)
     STOCKFISH.set_fen_position(board.fen())
-    best_move_uci = STOCKFISH.get_best_move_time(50) # Instantaneous AI response
+    best_move_uci = STOCKFISH.get_best_move_time(50)
 
     if best_move_uci:
         ai_move = chess.Move.from_uci(best_move_uci)
@@ -274,6 +274,32 @@ def parse_player_move(board: chess.Board, text: str) -> chess.Move:
     raise ValueError(f"'{text}' is not recognized as a legal SAN or UCI move.")
 
 
+def execute_takeback():
+    """Reverts the player's last turn (undoes AI counter-move + Player move)."""
+    if st.session_state.takeback_used or not st.session_state.move_history:
+        return
+
+    # If AI already responded (even number of moves), pop both AI and Player moves.
+    # If only Player moved (e.g., player delivered checkmate/stalemate), pop 1 move.
+    moves_to_pop = 2 if len(st.session_state.move_history) % 2 == 0 else 1
+
+    for _ in range(moves_to_pop):
+        if st.session_state.board.move_stack:
+            st.session_state.board.pop()
+        if st.session_state.move_history:
+            st.session_state.move_history.pop()
+
+    # Cancel/ignore any in-flight background analysis for the undone move
+    st.session_state.is_analyzing = False
+    if "analysis_future" in st.session_state:
+        st.session_state.analysis_future.cancel()
+        del st.session_state["analysis_future"]
+
+    st.session_state.takeback_used = True
+    st.session_state.last_move_time = time.time()
+    st.session_state.coach_text = "Takeback used! You have 0 takebacks remaining. Make your new move."
+
+
 # ==========================================
 # 5. Session State Management
 # ==========================================
@@ -289,6 +315,7 @@ def init_session_state():
         st.session_state.player_name = ""
         st.session_state.game_saved = False
         st.session_state.is_analyzing = False
+        st.session_state.takeback_used = False
         st.session_state.time_control_key = "Classical (25+5)"
         base_time, _ = TIME_CONTROLS["Classical (25+5)"]
         st.session_state.white_time = base_time
@@ -297,7 +324,7 @@ def init_session_state():
 
 
 def reset_game(time_control_name):
-    """Resets board and time controls."""
+    """Resets board, takeback allowance, and time controls."""
     st.session_state.board = chess.Board()
     st.session_state.move_history = []
     st.session_state.coach_text = "New game started! Make your opening move."
@@ -306,7 +333,11 @@ def reset_game(time_control_name):
     ]
     st.session_state.game_saved = False
     st.session_state.is_analyzing = False
-    
+    st.session_state.takeback_used = False
+
+    if "analysis_future" in st.session_state:
+        del st.session_state["analysis_future"]
+
     base_time, _ = TIME_CONTROLS.get(time_control_name, (None, 0))
     st.session_state.white_time = base_time
     st.session_state.black_time = base_time
@@ -345,7 +376,7 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.header("Game Settings")
-    
+
     selected_tc = st.sidebar.selectbox(
         "Time Control",
         options=list(TIME_CONTROLS.keys()),
@@ -366,7 +397,22 @@ def main():
         help="1 is easiest, 20 is Grandmaster level.",
     )
 
-    if st.sidebar.button("Restart / New Game"):
+    # --- Game Action Buttons (Takeback & Restart) ---
+    col_btn1, col_btn2 = st.sidebar.columns(2)
+
+    can_takeback = (
+        not st.session_state.takeback_used
+        and len(st.session_state.move_history) > 0
+        and not st.session_state.board.is_game_over()
+        and st.session_state.white_time != 0
+    )
+    takeback_label = "↩️ Takeback (1)" if not st.session_state.takeback_used else "↩️ Takeback (0)"
+
+    if col_btn1.button(takeback_label, disabled=not can_takeback, use_container_width=True):
+        execute_takeback()
+        st.rerun()
+
+    if col_btn2.button("🔄 New Game", use_container_width=True):
         reset_game(selected_tc)
 
     # --- Clock Management & Timeouts ---
@@ -376,7 +422,7 @@ def main():
         if st.session_state.board.turn == chess.WHITE:
             st.session_state.white_time = max(0, st.session_state.white_time - elapsed)
             if st.session_state.white_time == 0:
-                st.session_state.board.clear() # Flagged out
+                st.session_state.board.clear()
         st.session_state.last_move_time = time.time()
 
     # --- Main Layout ---
@@ -389,7 +435,7 @@ def main():
             b_min, b_sec = divmod(int(st.session_state.black_time), 60)
             col_clock1, col_clock2 = st.columns(2)
             col_clock1.metric("⏱️ White (You)", f"{w_min:02d}:{w_sec:02d}")
-            #col_clock2.metric("⏱️ Black (AI)", f"{b_min:02d}:{b_sec:02d}")
+            col_clock2.metric("⏱️ Black (AI)", f"{b_min:02d}:{b_sec:02d}")
 
         error_placeholder = st.empty()
         st.write(render_board(st.session_state.board), unsafe_allow_html=True)
@@ -406,7 +452,6 @@ def main():
                     try:
                         move = parse_player_move(st.session_state.board, move_input)
                         if move in st.session_state.board.legal_moves:
-                            # Apply time increment if applicable
                             if base_time is not None:
                                 st.session_state.white_time += increment
 
@@ -415,9 +460,10 @@ def main():
                             st.session_state.move_history.append({"san": san_move, "verdict": "Analyzing..."})
 
                             # Trigger asynchronous background coach analysis
-                            # Inside move submit logic:
                             st.session_state.is_analyzing = True
-                            st.session_state.analysis_future = ANALYSIS_EXECUTOR.submit(analyze_move_task, list(st.session_state.move_history))
+                            st.session_state.analysis_future = ANALYSIS_EXECUTOR.submit(
+                                analyze_move_task, list(st.session_state.move_history)
+                            )
 
                             # Execute immediate AI counter-move
                             if not st.session_state.board.is_game_over():
@@ -439,16 +485,21 @@ def main():
     with col2:
         st.subheader("Coach's Corner")
 
-        bg_color = "#f0f2f6"
-        # Define an auto-refreshing fragment when analysis is pending
         @st.fragment(run_every=2.0 if st.session_state.is_analyzing else None)
         def render_coach_corner():
-            # Check if the background task has completed
             if "analysis_future" in st.session_state and st.session_state.analysis_future.done():
-                analysis, verdict = st.session_state.analysis_future.result()
-                st.session_state.coach_text = analysis
-                if st.session_state.move_history:
-                    st.session_state.move_history[-1]["verdict"] = verdict
+                try:
+                    analysis, verdict = st.session_state.analysis_future.result()
+                    if analysis is not None:
+                        st.session_state.coach_text = analysis
+                    # Attach verdict to the last human move in move_history
+                    if st.session_state.move_history:
+                        for i in range(len(st.session_state.move_history) - 1, -1, -1):
+                            if st.session_state.move_history[i].get("verdict") != "AI":
+                                st.session_state.move_history[i]["verdict"] = verdict
+                                break
+                except Exception:
+                    pass
                 st.session_state.is_analyzing = False
                 del st.session_state["analysis_future"]
 
@@ -458,10 +509,14 @@ def main():
                 target_idx = history_len - 1 if history_len % 2 != 0 else history_len - 2
                 if target_idx >= 0:
                     latest_verdict = st.session_state.move_history[target_idx].get("verdict", "").upper()
-                    if "[GOOD]" in latest_verdict: bg_color = "#d4edda"
-                    elif "[INACCURACY]" in latest_verdict: bg_color = "#fff3cd"
-                    elif "[MISTAKE]" in latest_verdict: bg_color = "#ffe5d0"
-                    elif "[BLUNDER]" in latest_verdict: bg_color = "#f8d7da"
+                    if "[GOOD]" in latest_verdict:
+                        bg_color = "#d4edda"
+                    elif "[INACCURACY]" in latest_verdict:
+                        bg_color = "#fff3cd"
+                    elif "[MISTAKE]" in latest_verdict:
+                        bg_color = "#ffe5d0"
+                    elif "[BLUNDER]" in latest_verdict:
+                        bg_color = "#f8d7da"
 
             analysis_display = st.session_state.coach_text
             if st.session_state.is_analyzing:
