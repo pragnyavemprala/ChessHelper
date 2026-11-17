@@ -155,10 +155,10 @@ TIME_CONTROLS = {
 }
 
 
-def render_board(board):
-    """Renders the chess board SVG as HTML."""
+def render_board(board, flipped=False):
+    """Renders the chess board SVG as HTML, flipped if playing as Black."""
     last_move = board.peek() if board.move_stack else None
-    board_svg = chess.svg.board(board=board, lastmove=last_move, size=450)
+    board_svg = chess.svg.board(board=board, lastmove=last_move, flipped=flipped, size=450)
     b64 = base64.b64encode(board_svg.encode("utf-8")).decode("utf-8")
     return f'<img src="data:image/svg+xml;base64,{b64}"/>'
 
@@ -189,14 +189,16 @@ def analyze_move_task(move_history_snapshot):
         return f"Coach analysis unavailable: {e}", ""
 
 
-def get_conversational_coach_reply(board, move_history, chat_messages):
+def get_conversational_coach_reply(board, move_history, chat_messages, player_color):
     """Carries out a continuous conversational dialog with the coach."""
     moves_str = ", ".join([m["san"] for m in move_history]) if move_history else "No moves made yet"
     turn_str = "White" if board.turn == chess.WHITE else "Black"
+    user_color_str = "White" if player_color == chess.WHITE else "Black"
+    ai_color_str = "Black" if player_color == chess.WHITE else "White"
 
     system_instructions = (
         "You are an encouraging, insightful International Chess Grandmaster acting as a personal coach. "
-        "The player is playing as White against Stockfish (Black). Maintain an interactive, conversational tone. "
+        f"The player is playing as {user_color_str} against Stockfish ({ai_color_str}). Maintain an interactive, conversational tone. "
         f"Game FEN: {board.fen()}\n"
         f"Game Moves so far: {moves_str}\n"
         f"Current Turn to Move: {turn_str}\n"
@@ -274,14 +276,26 @@ def parse_player_move(board: chess.Board, text: str) -> chess.Move:
     raise ValueError(f"'{text}' is not recognized as a legal SAN or UCI move.")
 
 
-def execute_takeback():
-    """Reverts the player's last turn (undoes AI counter-move + Player move)."""
+def execute_takeback(player_color):
+    """Reverts the player's last turn taking side color into account."""
     if st.session_state.takeback_used or not st.session_state.move_history:
         return
 
-    # If AI already responded (even number of moves), pop both AI and Player moves.
-    # If only Player moved (e.g., player delivered checkmate/stalemate), pop 1 move.
-    moves_to_pop = 2 if len(st.session_state.move_history) % 2 == 0 else 1
+    # If player is White: 
+    # - If AI moved last (even len), pop 2 moves (AI + Player)
+    # - If player moved first and AI hasn't responded yet, pop 1 move.
+    # If player is Black:
+    # - If player just moved (even len after AI's white move), pop 2 moves (Player + AI)
+    # - If AI hasn't moved yet (len 0), nothing to pop.
+    history_len = len(st.session_state.move_history)
+    
+    if player_color == chess.WHITE:
+        moves_to_pop = 2 if history_len % 2 == 0 else 1
+    else:
+        moves_to_pop = 2 if history_len % 2 != 0 and history_len > 0 else 0
+
+    if moves_to_pop == 0:
+        return
 
     for _ in range(moves_to_pop):
         if st.session_state.board.move_stack:
@@ -289,7 +303,6 @@ def execute_takeback():
         if st.session_state.move_history:
             st.session_state.move_history.pop()
 
-    # Cancel/ignore any in-flight background analysis for the undone move
     st.session_state.is_analyzing = False
     if "analysis_future" in st.session_state:
         st.session_state.analysis_future.cancel()
@@ -316,6 +329,7 @@ def init_session_state():
         st.session_state.game_saved = False
         st.session_state.is_analyzing = False
         st.session_state.takeback_used = False
+        st.session_state.player_color = chess.WHITE
         st.session_state.time_control_key = "Classical (25+5)"
         base_time, _ = TIME_CONTROLS["Classical (25+5)"]
         st.session_state.white_time = base_time
@@ -323,17 +337,14 @@ def init_session_state():
         st.session_state.last_move_time = time.time()
 
 
-def reset_game(time_control_name):
-    """Resets board, takeback allowance, and time controls."""
+def reset_game(time_control_name, player_color, skill_level):
+    """Resets board, color selection, and time controls."""
     st.session_state.board = chess.Board()
     st.session_state.move_history = []
-    st.session_state.coach_text = "New game started! Make your opening move."
-    st.session_state.messages = [
-        {"role": "assistant", "content": "New game started! What would you like to open with?"}
-    ]
     st.session_state.game_saved = False
     st.session_state.is_analyzing = False
     st.session_state.takeback_used = False
+    st.session_state.player_color = player_color
 
     if "analysis_future" in st.session_state:
         del st.session_state["analysis_future"]
@@ -342,6 +353,21 @@ def reset_game(time_control_name):
     st.session_state.white_time = base_time
     st.session_state.black_time = base_time
     st.session_state.last_move_time = time.time()
+
+    # If player chose Black, AI (White) makes the opening move automatically
+    if player_color == chess.BLACK:
+        ai_san = execute_ai_move(st.session_state.board, skill_level)
+        if ai_san:
+            st.session_state.move_history.append({"san": ai_san, "verdict": "AI"})
+        st.session_state.coach_text = "New game started as Black! AI (White) has opened. Make your move."
+        st.session_state.messages = [
+            {"role": "assistant", "content": "You are playing as Black. Stockfish opened as White—what's your response?"}
+        ]
+    else:
+        st.session_state.coach_text = "New game started as White! Make your opening move."
+        st.session_state.messages = [
+            {"role": "assistant", "content": "New game started! What would you like to open with?"}
+        ]
     st.rerun()
 
 
@@ -377,18 +403,21 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("Game Settings")
 
+    # Side Selection
+    selected_side = st.sidebar.radio(
+        "Play as:",
+        options=["White", "Black"],
+        index=0 if st.session_state.player_color == chess.WHITE else 1,
+        horizontal=True
+    )
+    new_player_color = chess.WHITE if selected_side == "White" else chess.BLACK
+
     selected_tc = st.sidebar.selectbox(
         "Time Control",
         options=list(TIME_CONTROLS.keys()),
         index=list(TIME_CONTROLS.keys()).index(st.session_state.time_control_key)
     )
-    if selected_tc != st.session_state.time_control_key:
-        st.session_state.time_control_key = selected_tc
-        base_time, _ = TIME_CONTROLS[selected_tc]
-        st.session_state.white_time = base_time
-        st.session_state.black_time = base_time
-        st.session_state.last_move_time = time.time()
-
+    
     current_skill_level = st.sidebar.slider(
         "AI Difficulty (Skill Level)",
         min_value=1,
@@ -397,14 +426,18 @@ def main():
         help="1 is easiest, 20 is Grandmaster level.",
     )
 
-    # --- Game Action Buttons (Takeback & Restart) ---
+    # Detect if user changed color setting or time control and prompt reset if game is active
+    settings_changed = (new_player_color != st.session_state.player_color) or (selected_tc != st.session_state.time_control_key)
+
+    if settings_changed and len(st.session_state.move_history) > 0:
+        st.sidebar.warning("Changing settings will start a new game.")
+
     col_btn1, col_btn2 = st.sidebar.columns(2)
 
     can_takeback = (
         not st.session_state.takeback_used
         and len(st.session_state.move_history) > 0
         and not st.session_state.board.is_game_over()
-        and st.session_state.white_time != 0
     )
     takeback_label = "↩️ Takeback (1)" if not st.session_state.takeback_used else "↩️ Takeback (0)"
 
@@ -413,7 +446,14 @@ def main():
         st.rerun()
 
     if col_btn2.button("🔄 New Game", use_container_width=True):
-        reset_game(selected_tc)
+        reset_game(selected_tc, new_player_color, current_skill_level)
+
+    if settings_changed and len(st.session_state.move_history) == 0:
+        st.session_state.player_color = new_player_color
+        st.session_state.time_control_key = selected_tc
+        base_time, _ = TIME_CONTROLS[selected_tc]
+        st.session_state.white_time = base_time
+        st.session_state.black_time = base_time
 
     # --- Clock Management & Timeouts ---
     base_time, increment = TIME_CONTROLS[st.session_state.time_control_key]
@@ -423,24 +463,36 @@ def main():
             st.session_state.white_time = max(0, st.session_state.white_time - elapsed)
             if st.session_state.white_time == 0:
                 st.session_state.board.clear()
+        else:
+            st.session_state.black_time = max(0, st.session_state.black_time - elapsed)
+            if st.session_state.black_time == 0:
+                st.session_state.board.clear()
         st.session_state.last_move_time = time.time()
 
     # --- Main Layout ---
     col1, col2 = st.columns([3, 2])
 
     with col1:
-        # Display Clocks
+        # Display Clocks based on color perspective
         if base_time is not None:
             w_min, w_sec = divmod(int(st.session_state.white_time), 60)
             b_min, b_sec = divmod(int(st.session_state.black_time), 60)
             col_clock1, col_clock2 = st.columns(2)
-            col_clock1.metric("⏱️ White (You)", f"{w_min:02d}:{w_sec:02d}")
-            col_clock2.metric("⏱️ Black (AI)", f"{b_min:02d}:{b_sec:02d}")
+            if st.session_state.player_color == chess.WHITE:
+                col_clock1.metric("⏱️ White (You)", f"{w_min:02d}:{w_sec:02d}")
+                col_clock2.metric("⏱️ Black (AI)", f"{b_min:02d}:{b_sec:02d}")
+            else:
+                col_clock1.metric("⏱️ Black (You)", f"{b_min:02d}:{b_sec:02d}")
+                col_clock2.metric("⏱️ White (AI)", f"{w_min:02d}:{w_sec:02d}")
 
         error_placeholder = st.empty()
-        st.write(render_board(st.session_state.board), unsafe_allow_html=True)
+        is_board_flipped = (st.session_state.player_color == chess.BLACK)
+        st.write(render_board(st.session_state.board, flipped=is_board_flipped), unsafe_allow_html=True)
 
-        if not st.session_state.board.is_game_over() and st.session_state.white_time != 0:
+        is_player_turn = (st.session_state.board.turn == st.session_state.player_color)
+        player_timed_out = (st.session_state.white_time == 0 if st.session_state.player_color == chess.WHITE else st.session_state.black_time == 0)
+
+        if not st.session_state.board.is_game_over() and not player_timed_out:
             with st.form(key="chess_move_form", clear_on_submit=True):
                 move_input = st.text_input("Enter Move (SAN notation e.g., e4, Nf3, O-O):")
                 submit_button = st.form_submit_button("Play Move")
@@ -448,12 +500,17 @@ def main():
             if submit_button and move_input:
                 if not st.session_state.player_name:
                     error_placeholder.warning("Please enter your player name in the sidebar before moving.")
+                elif not is_player_turn:
+                    error_placeholder.warning("Please wait for your turn.")
                 else:
                     try:
                         move = parse_player_move(st.session_state.board, move_input)
                         if move in st.session_state.board.legal_moves:
                             if base_time is not None:
-                                st.session_state.white_time += increment
+                                if st.session_state.player_color == chess.WHITE:
+                                    st.session_state.white_time += increment
+                                else:
+                                    st.session_state.black_time += increment
 
                             san_move = st.session_state.board.san(move)
                             st.session_state.board.push(move)
@@ -465,7 +522,7 @@ def main():
                                 analyze_move_task, list(st.session_state.move_history)
                             )
 
-                            # Execute immediate AI counter-move
+                            # Execute immediate AI counter-move if game not over
                             if not st.session_state.board.is_game_over():
                                 ai_san = execute_ai_move(st.session_state.board, current_skill_level)
                                 if ai_san:
@@ -477,7 +534,7 @@ def main():
                     except ValueError:
                         error_placeholder.error("Invalid move! Use SAN (e.g., e4, Nf3, O-O) or squares (e1g1).")
         else:
-            if st.session_state.white_time == 0:
+            if player_timed_out:
                 st.error("Time out! You lost on time.")
             else:
                 st.info("Game Over.")
@@ -492,7 +549,6 @@ def main():
                     analysis, verdict = st.session_state.analysis_future.result()
                     if analysis is not None:
                         st.session_state.coach_text = analysis
-                    # Attach verdict to the last human move in move_history
                     if st.session_state.move_history:
                         for i in range(len(st.session_state.move_history) - 1, -1, -1):
                             if st.session_state.move_history[i].get("verdict") != "AI":
@@ -548,7 +604,8 @@ def main():
                 reply = get_conversational_coach_reply(
                     st.session_state.board,
                     st.session_state.move_history,
-                    st.session_state.messages
+                    st.session_state.messages,
+                    st.session_state.player_color
                 )
                 st.session_state.messages.append({"role": "assistant", "content": reply})
             st.rerun()
@@ -562,29 +619,39 @@ def main():
     pairs = []
     for i in range(0, len(history), 2):
         move_num = (i // 2) + 1
-        w_data = history[i]
-        b_data = history[i + 1] if i + 1 < len(history) else {"san": "...", "verdict": "AI"}
+        if st.session_state.player_color == chess.WHITE:
+            w_data = history[i]
+            b_data = history[i + 1] if i + 1 < len(history) else {"san": "...", "verdict": "AI"}
+        else:
+            # If playing as black, the AI made the first move (white)
+            b_data = history[i]
+            w_data = history[i + 1] if i + 1 < len(history) else {"san": "...", "verdict": "AI"}
         pairs.append((move_num, w_data, b_data))
 
     for m_num, w, b in reversed(pairs):
-        w_verdict = f" `{w['verdict']}`" if w["verdict"] and w["verdict"] != "Analyzing..." else ""
-        st.sidebar.markdown(f"**{m_num}.** {w['san']}{w_verdict} &nbsp;&nbsp; {b['san']}")
+        w_verdict = f" `{w['verdict']}`" if w.get("verdict") and w["verdict"] != "Analyzing..." else ""
+        b_verdict = f" `{b['verdict']}`" if b.get("verdict") and b["verdict"] != "Analyzing..." else ""
+        if st.session_state.player_color == chess.WHITE:
+            st.sidebar.markdown(f"**{m_num}.** {w['san']}{w_verdict} &nbsp;&nbsp; {b['san']}{b_verdict}")
+        else:
+            st.sidebar.markdown(f"**{m_num}.** {w['san']}{w_verdict} &nbsp;&nbsp; {b['san']}{b_verdict}")
 
 
 def handle_game_completion():
     """Handles end-of-game checks and triggers DynamoDB record write once."""
-    if not st.session_state.board.is_game_over() and st.session_state.white_time != 0:
+    player_timed_out = (st.session_state.white_time == 0 if st.session_state.player_color == chess.WHITE else st.session_state.black_time == 0)
+    if not st.session_state.board.is_game_over() and not player_timed_out:
         return
 
-    if st.session_state.white_time == 0:
-        result = "0-1"
+    if player_timed_out:
         status = "AI Won"
+        result = "0-1" if st.session_state.player_color == chess.WHITE else "1-0"
     else:
         result = st.session_state.board.result()
         if result == "1-0":
-            status = "Player Won"
+            status = "Player Won" if st.session_state.player_color == chess.WHITE else "AI Won"
         elif result == "0-1":
-            status = "AI Won"
+            status = "AI Won" if st.session_state.player_color == chess.WHITE else "Player Won"
         else:
             status = "Draw"
 
