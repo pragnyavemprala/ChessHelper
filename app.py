@@ -442,18 +442,14 @@ def main():
     takeback_label = "↩️ Takeback (1)" if not st.session_state.takeback_used else "↩️ Takeback (0)"
 
     if col_btn1.button(takeback_label, disabled=not can_takeback, use_container_width=True):
-        execute_takeback()
+        execute_takeback(st.session_state.player_color)
         st.rerun()
 
     if col_btn2.button("🔄 New Game", use_container_width=True):
         reset_game(selected_tc, new_player_color, current_skill_level)
 
     if settings_changed and len(st.session_state.move_history) == 0:
-        st.session_state.player_color = new_player_color
-        st.session_state.time_control_key = selected_tc
-        base_time, _ = TIME_CONTROLS[selected_tc]
-        st.session_state.white_time = base_time
-        st.session_state.black_time = base_time
+        reset_game(selected_tc, new_player_color, current_skill_level)
 
     # --- Clock Management & Timeouts ---
     base_time, increment = TIME_CONTROLS[st.session_state.time_control_key]
