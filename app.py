@@ -25,8 +25,8 @@ def load_config():
         config = {
             "openai_api_key": st.secrets["OPENAI_API_KEY"],
             "coach_prompt": st.secrets["COACH_PROMPT"],
-            "model_id": st.secrets.get("MODEL_NAME"),
-            "astra_model_id": st.secrets.get("ASTRA_MODEL_NAME"),
+            "model_id": st.secrets.get("MODEL_NAME") or "gpt-6-luna",
+            "astra_model_id": st.secrets.get("ASTRA_MODEL_NAME") or "gpt-6.2-astra",
             "aws_access_key": st.secrets.get("AWS_ACCESS_KEY_ID"),
             "aws_secret_key": st.secrets.get("AWS_SECRET_ACCESS_KEY"),
             "aws_region": st.secrets.get("AWS_DEFAULT_REGION", "us-east-1"),
@@ -119,13 +119,13 @@ def save_game_record(player_name: str, status: str, history: list, summary: str)
 def load_assets():
     """Initializes standard LLM, GPT-6.2 Astra pre-move coach, and Stockfish engine."""
     chat_model = init_chat_model(
-        CONFIG["model_id"],
+        model=CONFIG["model_id"],
         model_provider="openai",
         api_key=CONFIG["openai_api_key"],
     )
 
     astra_model = init_chat_model(
-        CONFIG["astra_model_id"],
+        model=CONFIG["astra_model_id"],
         model_provider="openai",
         api_key=CONFIG["openai_api_key"],
     )
