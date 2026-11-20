@@ -84,14 +84,17 @@ def get_player_stats(player_name: str):
         return {"total_games": 0, "wins": 0, "is_new": True}
 
 
-def save_game_record(player_name: str, status: str, history: list, summary: str):
-    """Saves the full game details to DynamoDB upon game completion."""
+def save_game_record(player_name: str, status: str, history: list, summary: str, chat_messages: list):
+    """Saves the full game details including chat transcript to DynamoDB upon game completion."""
     table = get_dynamo_table()
     if not table or not player_name:
         return False
 
     player_moves = [m["san"] for i, m in enumerate(history) if i % 2 == 0]
-    ai_moves = [m["san"] for i, m in enumerate(history) if i % 2 == 0]
+    ai_moves = [m["san"] for i, m in enumerate(history) if i % 2 != 0]
+    
+    # Serialize chat messages into a readable format for DynamoDB
+    formatted_chat = [f"{msg['role'].upper()}: {msg['content']}" for msg in chat_messages if msg.get("role") != "system"]
 
     record = {
         "player_name": player_name.strip().lower(),
@@ -101,6 +104,7 @@ def save_game_record(player_name: str, status: str, history: list, summary: str)
         "player_moves": player_moves,
         "ai_moves": ai_moves,
         "summary": summary,
+        "chat_transcript": formatted_chat,
         "total_moves": len(history),
     }
 
@@ -198,8 +202,7 @@ def analyze_move_task(move_history_snapshot):
 
 def evaluate_candidate_move_with_astra(board, move_history, proposed_move_text, player_color):
     """
-    Uses GPT-6.2 Astra for a single-turn evaluation of the player's proposed move.
-    Strictly evaluates the proposed move without recommending alternatives.
+    Uses GPT-6.2 Astra to evaluate the player's proposed move.
     """
     moves_str = ", ".join([m["san"] for m in move_history]) if move_history else "No moves made yet"
     user_color_str = "White" if player_color == chess.WHITE else "Black"
@@ -212,11 +215,11 @@ def evaluate_candidate_move_with_astra(board, move_history, proposed_move_text, 
         f"Move History: {moves_str}\n"
         f"Legal Moves in this position: {legal_sans}\n\n"
         "STRICT RULES:\n"
-        "1. The student is proposing a candidate move they plan to play next. Evaluate ONLY the move they proposed.\n"
-        "2. State clearly whether their proposed move is a **Good Move**, **Dubious/Inaccurate**, or a **Mistake/Blunder** in this position, and explain the concrete tactical or positional consequences (e.g., what it controls, weakens, leaves undefended, or allows the opponent to do).\n"
-        "3. NEVER recommend, suggest, name, or hint at any alternative move or different piece to play. Even if their proposed move is terrible, do NOT tell them what to play instead.\n"
-        "4. If their input is not a legal chess move in the current position, briefly tell them it is illegal and remind them to play a valid move on the board.\n"
-        "5. Keep your response concise (1-2 short paragraphs) and conclude by prompting them to make their move on the board now."
+        "1. Evaluate ONLY the move they proposed.\n"
+        "2. State clearly whether their proposed move is a **Good Move**, **Dubious/Inaccurate**, or a **Mistake/Blunder** in this position, and explain the concrete tactical or positional consequences.\n"
+        "3. NEVER recommend, suggest, name, or hint at any alternative move or different piece to play.\n"
+        "4. If their input is not a legal chess move in the current position, briefly tell them it is illegal.\n"
+        "5. Keep your response concise (1-2 short paragraphs)."
     )
 
     formatted_messages = [
@@ -231,24 +234,25 @@ def evaluate_candidate_move_with_astra(board, move_history, proposed_move_text, 
         return f"Astra could not evaluate that move right now: {e}. Please go ahead and make your move on the board."
 
 
-def start_turn_consultation_prompt():
-    """Resets the chat panel so Astra initiates a fresh 1-turn check-in for the new move."""
-    st.session_state.consulted_this_turn = False
-    st.session_state.messages = [
-        {
-            "role": "assistant",
-            "content": "What move would you like to make next? Tell me your candidate move before playing it, and I'll tell you if it's solid.",
-        }
-    ]
+def init_chat_history():
+    """Initializes persistent chat history if not already present."""
+    if "messages" not in st.session_state:
+        st.session_state.messages = [
+            {
+                "role": "assistant",
+                "content": "Hello! I am your AI Chess Coach powered by GPT-6.2 Astra. Ask me questions or check your candidate moves here throughout the game.",
+            }
+        ]
 
 
-def generate_game_summary(move_history, result_text):
-    """Generates an end-of-game summary review."""
+def generate_game_summary(move_history, result_text, chat_messages):
+    """Generates an end-of-game summary review incorporating move history and chat exchanges."""
     moves_str = ", ".join([m["san"] for m in move_history])
+    chat_snippet = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_messages[-6:]]) # Last few interactions
     messages = [
         SystemMessage(content=CONFIG["coach_prompt"]),
         HumanMessage(
-            content=f"Game finished with result '{result_text}'. Moves: {moves_str}. Provide a concise 2-sentence match summary."
+            content=f"Game finished with result '{result_text}'. Moves: {moves_str}. Recent Coach/Player Chat: {chat_snippet}. Provide a concise 2-3 sentence match summary incorporating key discussions."
         ),
     ]
     try:
@@ -327,9 +331,9 @@ def execute_takeback(player_color):
     st.session_state.takeback_used = True
     st.session_state.last_move_time = time.time()
     st.session_state.coach_text = "Takeback used! You have 0 takebacks remaining. Make your new move."
-
-    # Re-open single-turn pre-move consultation for the retried turn
-    start_turn_consultation_prompt()
+    
+    # Log takeback in chat history
+    st.session_state.messages.append({"role": "assistant", "content": "⚠️ Takeback used. Position reverted."})
 
 
 # ==========================================
@@ -351,11 +355,11 @@ def init_session_state():
         st.session_state.white_time = base_time
         st.session_state.black_time = base_time
         st.session_state.last_move_time = time.time()
-        start_turn_consultation_prompt()
+        init_chat_history()
 
 
 def reset_game(time_control_name, player_color, skill_level):
-    """Resets board, color selection, and time controls."""
+    """Resets board, color selection, time controls, and chat history."""
     st.session_state.board = chess.Board()
     st.session_state.move_history = []
     st.session_state.game_saved = False
@@ -372,6 +376,10 @@ def reset_game(time_control_name, player_color, skill_level):
     st.session_state.black_time = base_time
     st.session_state.last_move_time = time.time()
 
+    # Reset persistent chat history for new game
+    st.session_state.messages = []
+    init_chat_history()
+
     # If player chose Black, AI (White) makes the opening move automatically
     if player_color == chess.BLACK:
         ai_san = execute_ai_move(st.session_state.board, skill_level)
@@ -381,8 +389,6 @@ def reset_game(time_control_name, player_color, skill_level):
     else:
         st.session_state.coach_text = "New game started as White! Make your opening move."
 
-    # Initiate fresh pre-move check-in for the player's turn
-    start_turn_consultation_prompt()
     st.rerun()
 
 
@@ -488,12 +494,26 @@ def main():
             w_min, w_sec = divmod(int(st.session_state.white_time), 60)
             b_min, b_sec = divmod(int(st.session_state.black_time), 60)
             col_clock1, col_clock2 = st.columns(2)
+            
+            player_time = st.session_state.white_time if st.session_state.player_color == chess.WHITE else st.session_state.black_time
+            
             if st.session_state.player_color == chess.WHITE:
                 col_clock1.metric("⏱️ White (You)", f"{w_min:02d}:{w_sec:02d}")
                 col_clock2.metric("⏱️ Black (AI)", f"{b_min:02d}:{b_sec:02d}")
             else:
                 col_clock1.metric("⏱️ Black (You)", f"{b_min:02d}:{b_sec:02d}")
                 col_clock2.metric("⏱️ White (AI)", f"{w_min:02d}:{w_sec:02d}")
+
+            # --- ADD 2 MINUTES OPTION (< 5 minutes left) ---
+            game_active = not st.session_state.board.is_game_over() and player_time > 0
+            if game_active and player_time < 300: # 300 seconds = 5 minutes
+                if st.button("➕ Add 2 Minutes (+120s)", use_container_width=True):
+                    if st.session_state.player_color == chess.WHITE:
+                        st.session_state.white_time += 120
+                    else:
+                        st.session_state.black_time += 120
+                    st.success("Added 2 minutes to your clock!")
+                    st.rerun()
 
         error_placeholder = st.empty()
         is_board_flipped = st.session_state.player_color == chess.BLACK
@@ -506,7 +526,7 @@ def main():
             else st.session_state.black_time == 0
         )
 
-        if not st.session_state.board.is_game_over() and not player_timed_out:
+        if game_active and not player_timed_out:
             with st.form(key="chess_move_form", clear_on_submit=True):
                 move_input = st.text_input("Enter Move (SAN notation e.g., e4, Nf3, O-O):")
                 submit_button = st.form_submit_button("Play Move")
@@ -541,10 +561,6 @@ def main():
                                 ai_san = execute_ai_move(st.session_state.board, current_skill_level)
                                 if ai_san:
                                     st.session_state.move_history.append({"san": ai_san, "verdict": "AI"})
-
-                            # Reset pre-move Astra consultation for the player's next turn
-                            if not st.session_state.board.is_game_over():
-                                start_turn_consultation_prompt()
 
                             st.rerun()
                         else:
@@ -608,42 +624,39 @@ def main():
 
         render_coach_corner()
 
-        # Pre-Move Check-In with GPT-6.2 Astra (Strictly 1 exchange per player turn)
-        st.markdown("#### Pre-Move Check with GPT-6.2 Astra")
-        chat_container = st.container(height=280)
+        # Persistent Full-Game Chat with GPT-6.2 Astra
+        st.markdown("#### Chat with Coach & Astra")
+        chat_container = st.container(height=320)
         with chat_container:
             for message in st.session_state.messages:
                 with st.chat_message(message["role"]):
                     st.markdown(message["content"])
 
-        game_active = not st.session_state.board.is_game_over() and not player_timed_out
-        can_consult_astra = (
-            game_active
-            and is_player_turn
-            and not st.session_state.consulted_this_turn
-        )
-
-        if can_consult_astra:
-            if candidate_move := st.chat_input("Enter your candidate move (e.g., Nf3) to check before playing..."):
-                st.session_state.messages.append({"role": "user", "content": candidate_move})
-                with st.spinner("GPT-6.2 Astra is evaluating your idea..."):
+        if user_query := st.chat_input("Ask your coach about strategy or check candidate moves..."):
+            st.session_state.messages.append({"role": "user", "content": user_query})
+            with st.spinner("GPT-6.2 Astra is thinking..."):
+                # Check if it looks like a candidate move evaluation or general chess question
+                if len(user_query.split()) <= 2:
                     reply = evaluate_candidate_move_with_astra(
                         st.session_state.board,
                         st.session_state.move_history,
-                        candidate_move,
+                        user_query,
                         st.session_state.player_color,
                     )
-                    st.session_state.messages.append({"role": "assistant", "content": reply})
-                    # Lock chat for the remainder of this turn
-                    st.session_state.consulted_this_turn = True
-                st.rerun()
-        else:
-            if not game_active:
-                st.caption("Game over — pre-move check-in is closed.")
-            elif st.session_state.consulted_this_turn:
-                st.info("Pre-move check complete for this turn. Play your move on the board to unlock the next check-in.")
-            else:
-                st.caption("Waiting for your turn...")
+                else:
+                    # General chat response using CHAT_MODEL
+                    chat_history_objs = []
+                    for m in st.session_state.messages:
+                        if m["role"] == "user":
+                            chat_history_objs.append(HumanMessage(content=m["content"]))
+                        elif m["role"] == "assistant":
+                            chat_history_objs.append(AIMessage(content=m["content"]))
+                    
+                    response = CHAT_MODEL.invoke([SystemMessage(content=CONFIG["coach_prompt"])] + chat_history_objs)
+                    reply = response.content
+
+                st.session_state.messages.append({"role": "assistant", "content": reply})
+            st.rerun()
 
         handle_game_completion()
 
@@ -665,7 +678,10 @@ def main():
     for m_num, w, b in reversed(pairs):
         w_verdict = f" `{w['verdict']}`" if w.get("verdict") and w["verdict"] != "Analyzing..." else ""
         b_verdict = f" `{b['verdict']}`" if b.get("verdict") and b["verdict"] != "Analyzing..." else ""
-        st.sidebar.markdown(f"**{m_num}.** {w['san']}{w_verdict} &nbsp;&nbsp; {b['san']}{b_verdict}")
+        if st.session_state.player_color == chess.WHITE:
+            st.sidebar.markdown(f"**{m_num}.** {w['san']}{w_verdict} &nbsp;&nbsp; {b['san']}{b_verdict}")
+        else:
+            st.sidebar.markdown(f"**{m_num}.** {w['san']}{w_verdict} &nbsp;&nbsp; {b['san']}{b_verdict}")
 
 
 def handle_game_completion():
@@ -693,17 +709,18 @@ def handle_game_completion():
     st.success(f"Game Over! Result: {result} ({status})")
 
     if not st.session_state.game_saved:
-        with st.spinner("Saving match summary to DynamoDB..."):
-            summary = generate_game_summary(st.session_state.move_history, status)
+        with st.spinner("Saving match summary and chat log to DynamoDB..."):
+            summary = generate_game_summary(st.session_state.move_history, status, st.session_state.messages)
             if st.session_state.player_name:
                 saved = save_game_record(
                     st.session_state.player_name,
                     status,
                     st.session_state.move_history,
                     summary,
+                    st.session_state.messages,
                 )
                 if saved:
-                    st.toast("Game outcome recorded in DynamoDB!")
+                    st.toast("Game outcome and chat transcript recorded in DynamoDB!")
             st.session_state.game_saved = True
 
 
