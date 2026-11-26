@@ -6,6 +6,7 @@ import random
 import time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+from typing import List
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -13,6 +14,7 @@ import chess
 import chess.svg
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 from stockfish import Stockfish
 import streamlit as st
 
@@ -41,10 +43,27 @@ def load_config():
 
 CONFIG = load_config()
 ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+PUZZLE_RECORD_ID = "PUZZLE_PROGRESS_PROFILE"
 
 
 # ==========================================
-# 2. Opening Repertoire & Time Controls
+# 2. Pydantic Schema for AI Puzzle Generation
+# ==========================================
+class GeneratedPuzzle(BaseModel):
+    title: str = Field(description="Short descriptive name of the tactical or positional puzzle.")
+    fen: str = Field(description="Valid, legal chess FEN string for the puzzle starting position.")
+    solution: List[str] = Field(
+        description=(
+            "Exact sequence of 1 to 5 moves in Standard Algebraic Notation (SAN) starting with the side to move in the FEN. "
+            "If multi-move (3 or 5 plies), include the opponent's forced replies at odd indices."
+        )
+    )
+    theme: str = Field(description="Core chess tactical or strategic motif (e.g., Pin, Fork, Lucena Bridge, Greek Gift).")
+    hint: str = Field(description="One helpful Socratic hint without naming the exact move or destination square.")
+
+
+# ==========================================
+# 3. Opening Repertoire, Time Controls & Fallback Puzzles
 # ==========================================
 OPENINGS = {
     "Free Play (Standard Start)": {
@@ -94,7 +113,6 @@ OPENINGS = {
     },
 }
 
-# Instant book responses for common move-1 positions so UI never stalls on start
 OPENING_BOOK_TOP5 = {
     chess.STARTING_FEN: [
         {"rank": 1, "san": "e4", "uci": "e2e4", "eval": "+0.30"},
@@ -103,14 +121,14 @@ OPENING_BOOK_TOP5 = {
         {"rank": 4, "san": "c4", "uci": "c2c4", "eval": "+0.22"},
         {"rank": 5, "san": "g3", "uci": "g2g3", "eval": "+0.15"},
     ],
-    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1": [  # After 1. e4
+    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1": [
         {"rank": 1, "san": "c5", "uci": "c7c5", "eval": "+0.25"},
         {"rank": 2, "san": "e5", "uci": "e7e5", "eval": "+0.28"},
         {"rank": 3, "san": "e6", "uci": "e7e6", "eval": "+0.32"},
         {"rank": 4, "san": "c6", "uci": "c7c6", "eval": "+0.34"},
         {"rank": 5, "san": "d6", "uci": "d7d6", "eval": "+0.45"},
     ],
-    "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq - 0 1": [  # After 1. d4
+    "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq - 0 1": [
         {"rank": 1, "san": "Nf6", "uci": "g8f6", "eval": "+0.25"},
         {"rank": 2, "san": "d5", "uci": "d7d5", "eval": "+0.28"},
         {"rank": 3, "san": "e6", "uci": "e7e6", "eval": "+0.32"},
@@ -129,9 +147,105 @@ TIME_CONTROLS = {
     "Unlimited": (None, 0),
 }
 
+FALLBACK_PUZZLES = {
+    "Opening": [
+        {
+            "id": "fb_op_1",
+            "difficulty": 1,
+            "title": "Scholar's Mate Execution",
+            "fen": "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
+            "solution": ["Qxf7#"],
+            "theme": "Weak f7 Square",
+            "hint": "Look at Black's weakest square near the king, attacked by both queen and bishop.",
+        },
+        {
+            "id": "fb_op_2",
+            "difficulty": 2,
+            "title": "Fried Liver Attack Fork",
+            "fen": "r1bqkb1r/ppp2ppp/2n5/3np1N1/2B5/8/PPPP1PPP/RNBQK2R w KQkq - 0 6",
+            "solution": ["Nxf7"],
+            "theme": "Royal Fork on f7",
+            "hint": "Sacrifice the knight on f7 to fork Black's queen and rook.",
+        },
+    ],
+    "Middlegame": [
+        {
+            "id": "fb_mg_1",
+            "difficulty": 1,
+            "title": "Back-Rank Checkmate",
+            "fen": "6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1",
+            "solution": ["Rd8#"],
+            "theme": "Back-Rank Weakness",
+            "hint": "Black's king has no luft behind its own pawns.",
+        },
+        {
+            "id": "fb_mg_2",
+            "difficulty": 2,
+            "title": "Discovered Attack on the Queen",
+            "fen": "3q2k1/5ppp/8/3B4/8/3R4/5PPP/6K1 w - - 0 1",
+            "solution": ["Bxf7+", "Kxf7", "Rxd8"],
+            "theme": "Discovered Attack",
+            "hint": "Move your bishop with check so your rook uncovers an attack on Black's queen.",
+        },
+    ],
+    "Endgame": [
+        {
+            "id": "fb_eg_1",
+            "difficulty": 1,
+            "title": "Ladder Checkmate",
+            "fen": "7k/R7/1R6/8/8/8/8/6K1 w - - 0 1",
+            "solution": ["Rb8#"],
+            "theme": "Two-Rook Mate",
+            "hint": "Your rook on a7 cuts off the 7th rank. Deliver mate on the 8th rank.",
+        },
+        {
+            "id": "fb_eg_2",
+            "difficulty": 2,
+            "title": "Rook Skewer on the 8th Rank",
+            "fen": "3k3r/8/8/8/8/8/8/R3K3 w - - 0 1",
+            "solution": ["Ra8+", "Kc7", "Rxh8"],
+            "theme": "Linear Skewer",
+            "hint": "Check the king along the 8th rank to win the rook behind it.",
+        },
+    ],
+}
+
+
+def default_puzzle_stats():
+    """Returns clean default puzzle tracking structure for all three phases."""
+    return {
+        "Opening": {
+            "level": 1,
+            "attempted": 0,
+            "correct": 0,
+            "streak": 0,
+            "seen_titles": [],
+            "seen_fens": [],
+            "missed_themes": [],
+        },
+        "Middlegame": {
+            "level": 1,
+            "attempted": 0,
+            "correct": 0,
+            "streak": 0,
+            "seen_titles": [],
+            "seen_fens": [],
+            "missed_themes": [],
+        },
+        "Endgame": {
+            "level": 1,
+            "attempted": 0,
+            "correct": 0,
+            "streak": 0,
+            "seen_titles": [],
+            "seen_fens": [],
+            "missed_themes": [],
+        },
+    }
+
 
 # ==========================================
-# 3. Database Layer (DynamoDB)
+# 4. Database Layer (DynamoDB)
 # ==========================================
 @st.cache_resource
 def get_dynamo_table():
@@ -150,7 +264,7 @@ def get_dynamo_table():
 
 
 def get_player_stats(player_name: str):
-    """Queries DynamoDB for player records and calculates win/total games."""
+    """Queries DynamoDB for player match records (excluding puzzle profile item)."""
     table = get_dynamo_table()
     if not table or not player_name:
         return {"total_games": 0, "wins": 0, "is_new": True}
@@ -159,7 +273,11 @@ def get_player_stats(player_name: str):
         response = table.query(
             KeyConditionExpression=Key("player_name").eq(player_name.strip().lower())
         )
-        items = response.get("Items", [])
+        items = [
+            item
+            for item in response.get("Items", [])
+            if item.get("game_id") != PUZZLE_RECORD_ID
+        ]
         if not items:
             return {"total_games": 0, "wins": 0, "is_new": True}
 
@@ -168,6 +286,86 @@ def get_player_stats(player_name: str):
     except Exception as e:
         st.warning(f"Could not retrieve player statistics: {e}")
         return {"total_games": 0, "wins": 0, "is_new": True}
+
+
+def load_puzzle_progress(player_name: str) -> dict:
+    """Loads saved puzzle stats, levels, and missed themes from DynamoDB for `player_name`."""
+    base = default_puzzle_stats()
+    table = get_dynamo_table()
+    if not table or not player_name:
+        return base
+
+    try:
+        resp = table.get_item(
+            Key={
+                "player_name": player_name.strip().lower(),
+                "game_id": PUZZLE_RECORD_ID,
+            }
+        )
+        item = resp.get("Item")
+        if not item or "sections" not in item:
+            return base
+
+        saved_sections = item["sections"]
+        for sec in ["Opening", "Middlegame", "Endgame"]:
+            if sec in saved_sections:
+                sec_data = saved_sections[sec]
+                base[sec]["level"] = int(sec_data.get("level", 1))
+                base[sec]["attempted"] = int(sec_data.get("attempted", 0))
+                base[sec]["correct"] = int(sec_data.get("correct", 0))
+                base[sec]["streak"] = int(sec_data.get("streak", 0))
+                base[sec]["seen_titles"] = list(sec_data.get("seen_titles", []))[-30:]
+                base[sec]["seen_fens"] = list(sec_data.get("seen_fens", []))[-30:]
+                base[sec]["missed_themes"] = list(sec_data.get("missed_themes", []))[-15:]
+        return base
+    except Exception:
+        return base
+
+
+def save_puzzle_progress(player_name: str, puzzle_stats: dict) -> bool:
+    """Persists puzzle record, accuracy, difficulty levels, and missed themes to DynamoDB."""
+    table = get_dynamo_table()
+    if not table or not player_name:
+        return False
+
+    clean_sections = {}
+    total_attempted = 0
+    total_correct = 0
+
+    for sec in ["Opening", "Middlegame", "Endgame"]:
+        data = puzzle_stats.get(sec, {})
+        att = int(data.get("attempted", 0))
+        cor = int(data.get("correct", 0))
+        total_attempted += att
+        total_correct += cor
+
+        clean_sections[sec] = {
+            "level": int(data.get("level", 1)),
+            "attempted": att,
+            "correct": cor,
+            "streak": int(data.get("streak", 0)),
+            "seen_titles": list(data.get("seen_titles", []))[-30:],
+            "seen_fens": list(data.get("seen_fens", []))[-30:],
+            "missed_themes": list(data.get("missed_themes", []))[-15:],
+        }
+
+    record = {
+        "player_name": player_name.strip().lower(),
+        "game_id": PUZZLE_RECORD_ID,
+        "display_name": player_name.strip(),
+        "record_type": "puzzle_progress",
+        "total_attempted": total_attempted,
+        "total_correct": total_correct,
+        "sections": clean_sections,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        table.put_item(Item=record)
+        return True
+    except Exception as e:
+        st.warning(f"Could not save puzzle progress to DynamoDB: {e}")
+        return False
 
 
 def save_game_record(player_name: str, status: str, history: list, summary: str, chat_messages: list):
@@ -205,7 +403,7 @@ def save_game_record(player_name: str, status: str, history: list, summary: str,
 
 
 # ==========================================
-# 4. Model & Engine Assets
+# 5. Model & Engine Assets
 # ==========================================
 @st.cache_resource
 def load_assets():
@@ -241,7 +439,7 @@ CHAT_MODEL, ASTRA_MODEL, STOCKFISH = load_assets()
 
 
 # ==========================================
-# 5. Chess, Engine Ranking & Coaching Logic
+# 6. Chess, Engine Ranking & Coaching Logic
 # ==========================================
 def render_board(board, flipped=False):
     """Renders the chess board SVG as HTML, flipped if playing as Black."""
@@ -255,7 +453,6 @@ def get_ranked_move_options(board: chess.Board, num_options: int = 5):
     """
     Returns up to `num_options` legal moves ranked from best to next-best,
     along with a randomized display list for multiple-choice buttons.
-    Uses fast book lookup for move 1 and shallow depth=8 MultiPV for midgame speed.
     """
     legal_moves = list(board.legal_moves)
     if not legal_moves:
@@ -264,7 +461,6 @@ def get_ranked_move_options(board: chess.Board, num_options: int = 5):
     limit = min(num_options, len(legal_moves))
     current_fen = board.fen()
 
-    # Instant lookup for standard starting positions
     if current_fen in OPENING_BOOK_TOP5:
         ranked = [dict(item) for item in OPENING_BOOK_TOP5[current_fen][:limit]]
         shuffled = list(ranked)
@@ -274,7 +470,7 @@ def get_ranked_move_options(board: chess.Board, num_options: int = 5):
     ranked = []
     if STOCKFISH:
         try:
-            STOCKFISH.set_depth(8)  # Keep shallow so MultiPV=5 finishes in <150ms
+            STOCKFISH.set_depth(8)
             STOCKFISH.set_fen_position(current_fen)
             top_moves = STOCKFISH.get_top_moves(limit)
 
@@ -297,7 +493,6 @@ def get_ranked_move_options(board: chess.Board, num_options: int = 5):
         except Exception:
             ranked = []
 
-    # Fallback if Stockfish returned fewer moves or timed out
     if len(ranked) < limit:
         existing_sans = {r["san"] for r in ranked}
         for m in legal_moves:
@@ -359,8 +554,7 @@ def generate_turn_coaching_bundle(
     """
     Single fast LLM call returning BOTH:
     1. Ranked feedback on all 5 candidate options (starting with #1 Best Move).
-    2. Socratic guided chat feedback evaluating the played move vs. AI reply
-       without spoiling the upcoming move.
+    2. Socratic guided chat feedback evaluating the played move vs. AI reply.
     """
     user_color_str = "White" if player_color == chess.WHITE else "Black"
     moves_str = ", ".join([m["san"] for m in move_history])
@@ -404,7 +598,6 @@ def generate_turn_coaching_bundle(
             return options_part.strip(), chat_part.strip()
         return raw.strip(), raw.strip()
     except Exception:
-        # Instant deterministic fallback so UI never hangs
         lines = []
         for opt in ranked_options:
             tag = " **(Your Move)**" if opt["san"] == chosen_san else ""
@@ -499,7 +692,6 @@ def execute_ai_move(board, skill_level):
             board.push(ai_move)
             return ai_san
     except Exception:
-        # Fallback to a random legal move if Stockfish subprocess hiccups
         legal = list(board.legal_moves)
         if legal:
             ai_move = random.choice(legal)
@@ -539,11 +731,7 @@ def process_player_turn(
     increment: int,
     current_skill_level: int,
 ):
-    """
-    Executes the player's move (from either typed input or option button),
-    plays the AI reply, generates ranked feedback for all 5 options starting
-    with the best move, and updates the guided coaching chat.
-    """
+    """Executes player move, plays AI reply, and updates ranked options & coaching chat."""
     fen_before = st.session_state.board.fen()
     ranked_snapshot = list(st.session_state.get("current_ranked_options", []))
 
@@ -557,19 +745,16 @@ def process_player_turn(
     st.session_state.board.push(move)
     st.session_state.move_history.append({"san": san_move, "verdict": "Analyzing..."})
 
-    # Clear cached options so next turn generates fresh candidates
     st.session_state.options_fen = None
     st.session_state.current_ranked_options = []
     st.session_state.current_shuffled_options = []
 
-    # AI counter-move first so chat guidance reflects the full turn
     ai_san = None
     if not st.session_state.board.is_game_over():
         ai_san = execute_ai_move(st.session_state.board, current_skill_level)
         if ai_san:
             st.session_state.move_history.append({"san": ai_san, "verdict": "AI"})
 
-    # Single combined LLM call for Options Ranked Feedback + Socratic Chat Reply
     options_feedback, guided_reply = generate_turn_coaching_bundle(
         fen_before_move=fen_before,
         board_after=st.session_state.board,
@@ -582,7 +767,6 @@ def process_player_turn(
     )
     st.session_state.last_options_feedback = options_feedback
 
-    # Background analysis for Coach's Corner badge
     st.session_state.is_analyzing = True
     st.session_state.analysis_future = ANALYSIS_EXECUTOR.submit(
         analyze_move_task, list(st.session_state.move_history)
@@ -631,10 +815,339 @@ def execute_takeback(player_color):
 
 
 # ==========================================
-# 6. Session State & Opening Setup
+# 7. OpenAI Dynamic Puzzle Generator & Spaced Repetition
+# ==========================================
+def validate_and_verify_puzzle(candidate: GeneratedPuzzle, section: str, difficulty: int) -> dict | None:
+    """
+    Validates that the LLM-generated FEN is legal, the board is not already over,
+    all solution moves are strictly legal SANs, and aligns the first move with Stockfish.
+    """
+    try:
+        board = chess.Board(candidate.fen)
+        if not board.is_valid() or board.is_game_over() or not candidate.solution:
+            return None
+
+        verified_solution = []
+        sim_board = board.copy()
+
+        for idx, san_str in enumerate(candidate.solution):
+            cleaned_san = san_str.strip()
+            move = sim_board.parse_san(cleaned_san)
+            if move not in sim_board.legal_moves:
+                return None
+
+            if idx == 0 and STOCKFISH:
+                try:
+                    STOCKFISH.set_skill_level(20)
+                    STOCKFISH.set_depth(10)
+                    STOCKFISH.set_fen_position(sim_board.fen())
+                    sf_best_uci = STOCKFISH.get_best_move_time(80)
+                    if sf_best_uci:
+                        sf_move = chess.Move.from_uci(sf_best_uci)
+                        if sf_move in sim_board.legal_moves and sf_move != move:
+                            test_b = sim_board.copy()
+                            test_b.push(move)
+                            if not test_b.is_checkmate():
+                                verified_solution = [sim_board.san(sf_move)]
+                                break
+                except Exception:
+                    pass
+
+            verified_solution.append(sim_board.san(move))
+            sim_board.push(move)
+            if sim_board.is_game_over():
+                break
+
+        if not verified_solution:
+            return None
+
+        return {
+            "id": f"ai_{section.lower()}_{uuid.uuid4().hex[:8]}",
+            "difficulty": difficulty,
+            "title": candidate.title,
+            "fen": board.fen(),
+            "solution": verified_solution,
+            "theme": candidate.theme,
+            "hint": candidate.hint,
+            "source": "OpenAI Generated",
+        }
+    except Exception:
+        return None
+
+
+def generate_ai_puzzle(
+    section: str,
+    difficulty: int,
+    seen_titles: list,
+    seen_fens: list,
+    target_weak_theme: str | None = None,
+) -> dict:
+    """
+    Calls OpenAI structured output (`ASTRA_MODEL`) to generate a brand-new, non-repeating
+    chess puzzle tailored to `section` and `difficulty`. If `target_weak_theme` is provided
+    from the player's missed-puzzle queue, composes a fresh reinforcement position on that motif.
+    """
+    difficulty_guide = {
+        1: "Level 1 (Beginner): 1-move mate, hanging piece capture, or simple 1-move fork.",
+        2: "Level 2 (Developing): 1-to-3 ply tactical motif (pin, skewer, discovered attack, or opening trap).",
+        3: "Level 3 (Intermediate): 3-ply forcing combination, sacrifice on f7/h7, or key endgame opposition.",
+        4: "Level 4 (Advanced): Multi-move tactical sequence, Lucena/Philidor rook technique, or deep counter-attack.",
+        5: "Level 5+ (Master): Complex quiet move, Zugzwang, or multi-step sacrificial combination.",
+    }
+    diff_desc = difficulty_guide.get(min(difficulty, 5), difficulty_guide[5])
+
+    avoid_titles = ", ".join(seen_titles[-15:]) if seen_titles else "None yet"
+    avoid_fens = "\n".join(seen_fens[-10:]) if seen_fens else "None yet"
+
+    reinforcement_directive = (
+        f"PRIORITY REINFORCEMENT FOCUS: The student recently struggled with the tactical/positional motif **'{target_weak_theme}'**. "
+        f"Compose a BRAND-NEW board position (different FEN and piece placement) that tests this exact '{target_weak_theme}' concept so they can practice and master it!"
+        if target_weak_theme
+        else "Choose a fresh tactical or positional motif appropriate for this game phase."
+    )
+
+    system_prompt = (
+        "You are a Chess Grandmaster Puzzle Composer generating unique, verified tactical and positional puzzles.\n"
+        f"Phase Section: {section}\n"
+        f"Target Difficulty: {diff_desc}\n"
+        f"{reinforcement_directive}\n\n"
+        "STRICT COMPOSITION RULES:\n"
+        "1. Compose a completely NEW, realistic chess position appropriate for the requested phase.\n"
+        "2. Ensure the FEN is 100% legal (exactly one White king, one Black king, no pawns on 1st/8th ranks, side not to move is NOT in check).\n"
+        "3. Provide exact legal SAN moves in `solution` (1 move for 1-ply puzzles, or 3 moves [player, opponent forced reply, player finisher] for combinations).\n"
+        f"4. NEVER repeat any of these previously generated puzzle titles: [{avoid_titles}]\n"
+        f"5. NEVER reuse any of these previous FENs:\n{avoid_fens}"
+    )
+
+    structured_llm = ASTRA_MODEL.with_structured_output(GeneratedPuzzle)
+
+    for _ in range(2):
+        try:
+            candidate = structured_llm.invoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(
+                        content=f"Generate a fresh, non-repeating {section} chess puzzle at Difficulty Level {difficulty}."
+                    ),
+                ]
+            )
+            if candidate and candidate.fen not in seen_fens:
+                verified = validate_and_verify_puzzle(candidate, section, difficulty)
+                if verified:
+                    verified["is_reinforcement"] = bool(target_weak_theme)
+                    return verified
+        except Exception:
+            continue
+
+    backup_pool = FALLBACK_PUZZLES[section]
+    unseen_backups = [p for p in backup_pool if p["fen"] not in seen_fens]
+    chosen = dict(random.choice(unseen_backups or backup_pool))
+    chosen["difficulty"] = difficulty
+    chosen["source"] = "Curated Backup"
+    chosen["is_reinforcement"] = bool(target_weak_theme)
+    return chosen
+
+
+def load_next_puzzle(section: str):
+    """Generates and loads a new OpenAI puzzle, prioritizing weak themes from missed attempts."""
+    stats = st.session_state.puzzle_stats[section]
+    target_diff = stats["level"]
+    missed_queue = stats.get("missed_themes", [])
+    target_weak_theme = missed_queue[0] if missed_queue else None
+
+    spinner_msg = (
+        f"🔁 Generating reinforcement {section} puzzle on **{target_weak_theme}**..."
+        if target_weak_theme
+        else f"✨ Generating unique Level {target_diff} {section} puzzle via OpenAI..."
+    )
+
+    with st.spinner(spinner_msg):
+        puzzle = generate_ai_puzzle(
+            section=section,
+            difficulty=target_diff,
+            seen_titles=stats["seen_titles"],
+            seen_fens=stats["seen_fens"],
+            target_weak_theme=target_weak_theme,
+        )
+
+    stats["seen_titles"].append(puzzle["title"])
+    stats["seen_fens"].append(puzzle["fen"])
+
+    st.session_state.current_puzzle = puzzle
+    st.session_state.puzzle_board = chess.Board(puzzle["fen"])
+    st.session_state.puzzle_step = 0
+    st.session_state.puzzle_solved = False
+    st.session_state.puzzle_counted_attempt = False
+    st.session_state.puzzle_failed_attempts = 0
+    st.session_state.puzzle_options_fen = None
+    st.session_state.puzzle_shuffled_options = []
+
+    if st.session_state.player_name:
+        save_puzzle_progress(st.session_state.player_name, st.session_state.puzzle_stats)
+
+    turn_label = "White" if st.session_state.puzzle_board.turn == chess.WHITE else "Black"
+    reinforce_tag = (
+        f"\n\n🎯 *Reinforcement Drill: Practicing **{target_weak_theme}** from a previous miss.*"
+        if target_weak_theme
+        else ""
+    )
+
+    st.session_state.puzzle_feedback = (
+        f"🧩 **Level {puzzle['difficulty']} — {puzzle['title']}** *(Theme: {puzzle['theme']})*\n\n"
+        f"You are playing **{turn_label}**. Find the strongest move!{reinforce_tag}"
+    )
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": (
+                f"🧩 **New {section} Puzzle (Level {puzzle['difficulty']}): {puzzle['title']}**\n\n"
+                f"Theme: *{puzzle['theme']}* — Find the best move for **{turn_label}**!{reinforce_tag}"
+            ),
+        }
+    )
+
+
+def evaluate_puzzle_attempt(move: chess.Move):
+    """
+    Validates a player's move against the puzzle solution, records Attempted vs. Correct
+    in DynamoDB, queues missed themes for repetition, and scales difficulty.
+    """
+    puzzle = st.session_state.current_puzzle
+    board = st.session_state.puzzle_board
+    step = st.session_state.puzzle_step
+    section = st.session_state.puzzle_section
+    stats = st.session_state.puzzle_stats[section]
+
+    expected_san = puzzle["solution"][step]
+    played_san = board.san(move)
+
+    board_copy = board.copy()
+    board_copy.push(move)
+    is_correct = (played_san == expected_san) or board_copy.is_checkmate()
+
+    if is_correct:
+        board.push(move)
+        st.session_state.puzzle_step += 1
+        st.session_state.puzzle_options_fen = None
+        st.session_state.puzzle_shuffled_options = []
+
+        if st.session_state.puzzle_step < len(puzzle["solution"]):
+            opp_san = puzzle["solution"][st.session_state.puzzle_step]
+            opp_move = board.parse_san(opp_san)
+            board.push(opp_move)
+            st.session_state.puzzle_step += 1
+
+            msg = (
+                f"✅ **{played_san}** is spot-on! The opponent replied **{opp_san}**. "
+                "Keep calculating—what is your winning follow-up move?"
+            )
+            st.session_state.puzzle_feedback = msg
+            st.session_state.messages.append({"role": "user", "content": f"Puzzle move: **{played_san}**"})
+            st.session_state.messages.append({"role": "assistant", "content": msg})
+        else:
+            st.session_state.puzzle_solved = True
+
+            # Count each puzzle once in Attempted & Correct (first-try clean solve counts as correct)
+            if not st.session_state.puzzle_counted_attempt:
+                stats["attempted"] += 1
+                if st.session_state.puzzle_failed_attempts == 0:
+                    stats["correct"] += 1
+                    stats["streak"] += 1
+                st.session_state.puzzle_counted_attempt = True
+
+            # If this puzzle was reinforcing a missed theme and solved cleanly, clear that theme from retry queue
+            cleared_theme_note = ""
+            if puzzle.get("theme") in stats["missed_themes"] and st.session_state.puzzle_failed_attempts == 0:
+                stats["missed_themes"].remove(puzzle["theme"])
+                cleared_theme_note = f"\n\n✨ **Pattern Mastered!** Cleared **{puzzle['theme']}** from your practice queue."
+
+            leveled_up = False
+            if stats["streak"] >= 2:
+                stats["level"] += 1
+                stats["streak"] = 0
+                leveled_up = True
+
+            if st.session_state.player_name:
+                save_puzzle_progress(st.session_state.player_name, st.session_state.puzzle_stats)
+
+            acc_pct = (stats["correct"] / stats["attempted"] * 100) if stats["attempted"] else 0.0
+            score_line = f"📊 **{section} Record:** **{stats['correct']} / {stats['attempted']}** correct ({acc_pct:.0f}%)"
+
+            level_note = (
+                f"\n\n🚀 **Level Up!** You've advanced to **Level {stats['level']}** in {section} puzzles!"
+                if leveled_up
+                else f"\n\n🔥 Streak: **{stats['streak']}/2** (Solve {2 - stats['streak']} more cleanly to reach Level {stats['level'] + 1}!)"
+            )
+
+            msg = (
+                f"🎉 **Puzzle Solved!** **{played_san}** nails the **{puzzle['theme']}** pattern.\n\n"
+                f"{score_line}{cleared_theme_note}{level_note}\n\nClick **Next Puzzle ➡️** to continue!"
+            )
+            st.session_state.puzzle_feedback = msg
+            st.session_state.messages.append({"role": "user", "content": f"Puzzle move: **{played_san}**"})
+            st.session_state.messages.append({"role": "assistant", "content": msg})
+    else:
+        st.session_state.puzzle_failed_attempts += 1
+        stats["streak"] = 0
+
+        # Record failed attempt once and queue this theme for spaced repetition
+        if not st.session_state.puzzle_counted_attempt:
+            stats["attempted"] += 1
+            st.session_state.puzzle_counted_attempt = True
+
+        theme_name = puzzle.get("theme", "Tactical Motif")
+        if theme_name not in stats["missed_themes"]:
+            stats["missed_themes"].append(theme_name)
+
+        leveled_down = False
+        if st.session_state.puzzle_failed_attempts >= 2 and stats["level"] > 1:
+            stats["level"] -= 1
+            leveled_down = True
+
+        if st.session_state.player_name:
+            save_puzzle_progress(st.session_state.player_name, st.session_state.puzzle_stats)
+
+        flaw_prompt = (
+            "You are a Socratic Chess Puzzle Coach.\n"
+            f"Puzzle Title: {puzzle['title']} | Theme: {puzzle['theme']}\n"
+            f"Current FEN: {board.fen()}\n"
+            f"Student tried: {played_san} (Incorrect)\n"
+            f"Coach Hint: {puzzle['hint']}\n\n"
+            "STRICT RULES:\n"
+            f"1. Explain briefly in 1-2 sentences why **{played_san}** fails or misses the tactic.\n"
+            "2. Give a helpful hint based on the theme without naming the solution move or destination square.\n"
+            "3. Ask the student to try again."
+        )
+        try:
+            resp = ASTRA_MODEL.invoke(
+                [
+                    SystemMessage(content=flaw_prompt),
+                    HumanMessage(content=f"I tried {played_san} in this puzzle. Why didn't it work?"),
+                ]
+            )
+            coach_hint_msg = resp.content
+        except Exception:
+            coach_hint_msg = (
+                f"❌ **{played_san}** isn't the strongest move here. "
+                f"**Hint:** {puzzle['hint']} Try again!"
+            )
+
+        coach_hint_msg += f"\n\n🔁 *Queued **{theme_name}** so we'll practice similar positions next.*"
+        if leveled_down:
+            coach_hint_msg += f"\n📉 *Difficulty adjusted to **Level {stats['level']}** to reinforce fundamentals.*"
+
+        st.session_state.puzzle_feedback = coach_hint_msg
+        st.session_state.messages.append({"role": "user", "content": f"Tried **{played_san}**"})
+        st.session_state.messages.append({"role": "assistant", "content": coach_hint_msg})
+
+
+# ==========================================
+# 8. Session State & Opening Setup
 # ==========================================
 def init_session_state():
     """Initializes each session state key independently to survive hot-reloads."""
+    if "app_mode" not in st.session_state:
+        st.session_state.app_mode = "Play Game"
     if "board" not in st.session_state:
         st.session_state.board = chess.Board()
     if "move_history" not in st.session_state:
@@ -643,6 +1156,8 @@ def init_session_state():
         st.session_state.coach_text = "Welcome! Select an opening or pick one of the 5 candidate moves below the board."
     if "player_name" not in st.session_state:
         st.session_state.player_name = ""
+    if "loaded_puzzle_player" not in st.session_state:
+        st.session_state.loaded_puzzle_player = ""
     if "game_saved" not in st.session_state:
         st.session_state.game_saved = False
     if "is_analyzing" not in st.session_state:
@@ -669,6 +1184,30 @@ def init_session_state():
         st.session_state.current_shuffled_options = []
     if "last_options_feedback" not in st.session_state:
         st.session_state.last_options_feedback = ""
+
+    # Puzzle mode session state
+    if "puzzle_section" not in st.session_state:
+        st.session_state.puzzle_section = "Opening"
+    if "puzzle_stats" not in st.session_state:
+        st.session_state.puzzle_stats = default_puzzle_stats()
+    if "current_puzzle" not in st.session_state:
+        st.session_state.current_puzzle = None
+    if "puzzle_board" not in st.session_state:
+        st.session_state.puzzle_board = chess.Board()
+    if "puzzle_step" not in st.session_state:
+        st.session_state.puzzle_step = 0
+    if "puzzle_solved" not in st.session_state:
+        st.session_state.puzzle_solved = False
+    if "puzzle_counted_attempt" not in st.session_state:
+        st.session_state.puzzle_counted_attempt = False
+    if "puzzle_failed_attempts" not in st.session_state:
+        st.session_state.puzzle_failed_attempts = 0
+    if "puzzle_feedback" not in st.session_state:
+        st.session_state.puzzle_feedback = ""
+    if "puzzle_options_fen" not in st.session_state:
+        st.session_state.puzzle_options_fen = None
+    if "puzzle_shuffled_options" not in st.session_state:
+        st.session_state.puzzle_shuffled_options = []
 
     init_chat_history()
 
@@ -713,14 +1252,12 @@ def reset_game(time_control_name, player_color, skill_level, opening_name="Free 
         st.session_state.board.push(move)
         st.session_state.move_history.append({"san": san, "verdict": "Book"})
 
-    # If playing Black (or opening ends with White to move), AI plays White's move immediately
     ai_opening_reply = None
     if st.session_state.board.turn != effective_color and not st.session_state.board.is_game_over():
         ai_opening_reply = execute_ai_move(st.session_state.board, skill_level)
         if ai_opening_reply:
             st.session_state.move_history.append({"san": ai_opening_reply, "verdict": "AI"})
 
-    # Pre-populate the top-5 candidate moves immediately for the player's turn
     ranked_opts, shuffled_opts = get_ranked_move_options(st.session_state.board, num_options=5)
     st.session_state.options_fen = st.session_state.board.fen()
     st.session_state.current_ranked_options = ranked_opts
@@ -750,13 +1287,27 @@ def reset_game(time_control_name, player_color, skill_level, opening_name="Free 
 
 
 # ==========================================
-# 7. UI Components & Main App
+# 9. UI Components & Main App
 # ==========================================
 def main():
-    st.set_page_config(page_title="AI Chess Coach with Opening Trainer", layout="wide")
+    st.set_page_config(page_title="AI Chess Coach & Adaptive Puzzles", layout="wide")
     init_session_state()
 
-    # --- Sidebar Configuration ---
+    # --- Sidebar: Mode Selection & Profile ---
+    st.sidebar.header("Training Mode")
+    selected_mode = st.sidebar.radio(
+        "Choose Activity:",
+        options=["Play Game", "Chess Puzzles"],
+        index=0 if st.session_state.app_mode == "Play Game" else 1,
+        horizontal=True,
+    )
+    if selected_mode != st.session_state.app_mode:
+        st.session_state.app_mode = selected_mode
+        if selected_mode == "Chess Puzzles" and st.session_state.current_puzzle is None:
+            load_next_puzzle(st.session_state.puzzle_section)
+        st.rerun()
+
+    st.sidebar.markdown("---")
     st.sidebar.header("Player Profile")
     player_input = st.sidebar.text_input(
         "Enter Player Name:",
@@ -764,21 +1315,187 @@ def main():
         placeholder="e.g. Kasparov",
     )
     if player_input:
-        st.session_state.player_name = player_input
-        stats = get_player_stats(player_input)
-        if stats["is_new"]:
-            st.sidebar.info(f"Welcome, **{player_input}**! New player registered.")
+        clean_name = player_input.strip()
+        st.session_state.player_name = clean_name
+
+        # Automatically load saved DynamoDB puzzle record when player name is entered/changed
+        if st.session_state.loaded_puzzle_player.lower() != clean_name.lower():
+            st.session_state.puzzle_stats = load_puzzle_progress(clean_name)
+            st.session_state.loaded_puzzle_player = clean_name
+
+        stats = get_player_stats(clean_name)
+        total_p_att = sum(st.session_state.puzzle_stats[s]["attempted"] for s in ["Opening", "Middlegame", "Endgame"])
+        total_p_cor = sum(st.session_state.puzzle_stats[s]["correct"] for s in ["Opening", "Middlegame", "Endgame"])
+        p_acc = (total_p_cor / total_p_att * 100) if total_p_att else 0.0
+
+        if stats["is_new"] and total_p_att == 0:
+            st.sidebar.info(f"Welcome, **{clean_name}**! New profile ready.")
         else:
             win_rate = (stats["wins"] / stats["total_games"] * 100) if stats["total_games"] else 0
             st.sidebar.success(
-                f"**{player_input}**'s Record:\n\n"
-                f"- Wins: **{stats['wins']}** / {stats['total_games']}\n"
-                f"- Win Rate: **{win_rate:.1f}%**"
+                f"**{clean_name}**'s Record:\n\n"
+                f"- Match Wins: **{stats['wins']}** / {stats['total_games']} ({win_rate:.1f}%)\n"
+                f"- Puzzles Solved: **{total_p_cor}** / {total_p_att} ({p_acc:.0f}%)"
             )
     else:
-        st.sidebar.warning("Please enter your name to track game stats.")
+        st.sidebar.warning("Enter your name to save & restore your match and puzzle records in DynamoDB.")
 
     st.sidebar.markdown("---")
+
+    # ==========================================
+    # MODE A: AI-GENERATED CHESS PUZZLES (3 SECTIONS)
+    # ==========================================
+    if st.session_state.app_mode == "Chess Puzzles":
+        st.sidebar.header("Puzzle Section & Progress")
+        section = st.sidebar.radio(
+            "Select Phase:",
+            options=["Opening", "Middlegame", "Endgame"],
+            index=["Opening", "Middlegame", "Endgame"].index(st.session_state.puzzle_section),
+        )
+        if section != st.session_state.puzzle_section:
+            st.session_state.puzzle_section = section
+            load_next_puzzle(section)
+            st.rerun()
+
+        p_stats = st.session_state.puzzle_stats[section]
+        sec_acc = (p_stats["correct"] / p_stats["attempted"] * 100) if p_stats["attempted"] else 0.0
+
+        c_m1, c_m2 = st.sidebar.columns(2)
+        c_m1.metric("Difficulty", f"Lvl {p_stats['level']}")
+        c_m2.metric("Score", f"{p_stats['correct']}/{p_stats['attempted']}", f"{sec_acc:.0f}%")
+
+        st.sidebar.progress(min(1.0, p_stats["streak"] / 2))
+        st.sidebar.caption(f"🔥 Streak to Level {p_stats['level'] + 1}: **{p_stats['streak']}/2**")
+
+        if p_stats.get("missed_themes"):
+            st.sidebar.warning(
+                "🔁 **Focus Themes (Missed):**\n- " + "\n- ".join(p_stats["missed_themes"])
+            )
+
+        if st.sidebar.button("🔄 Reset Section Progress", use_container_width=True):
+            st.session_state.puzzle_stats[section] = default_puzzle_stats()[section]
+            if st.session_state.player_name:
+                save_puzzle_progress(st.session_state.player_name, st.session_state.puzzle_stats)
+            load_next_puzzle(section)
+            st.rerun()
+
+        if st.session_state.current_puzzle is None:
+            load_next_puzzle(section)
+
+        puzzle = st.session_state.current_puzzle
+        p_board = st.session_state.puzzle_board
+        is_black_to_move = chess.Board(puzzle["fen"]).turn == chess.BLACK
+
+        col1, col2 = st.columns([3, 2])
+        with col1:
+            st.subheader(f"🧩 {section} Puzzle — Level {puzzle['difficulty']}: {puzzle['title']}")
+            st.caption(
+                f"Theme: **{puzzle['theme']}** | "
+                f"Section Score: **{p_stats['correct']} / {p_stats['attempted']}** ({sec_acc:.0f}%) | "
+                f"Source: `{puzzle.get('source', 'OpenAI Generated')}`"
+            )
+
+            p_error = st.empty()
+            st.write(render_board(p_board, flipped=is_black_to_move), unsafe_allow_html=True)
+
+            if not st.session_state.puzzle_solved:
+                with st.form(key="puzzle_move_form", clear_on_submit=True):
+                    p_move_input = st.text_input("Enter Best Move (SAN e.g., Qxf7#, Rd8+, Nc7+):")
+                    p_submit = st.form_submit_button("Submit Move")
+
+                if p_submit and p_move_input:
+                    try:
+                        move = parse_player_move(p_board, p_move_input)
+                        if move in p_board.legal_moves:
+                            evaluate_puzzle_attempt(move)
+                            st.rerun()
+                        else:
+                            p_error.error("Illegal move in this puzzle position!")
+                    except ValueError:
+                        p_error.error("Invalid notation! Use SAN (e.g., Nf3, Qxf7+) or UCI.")
+
+                cur_p_fen = p_board.fen()
+                if st.session_state.puzzle_options_fen != cur_p_fen or not st.session_state.puzzle_shuffled_options:
+                    _, shuffled_p_opts = get_ranked_move_options(p_board, num_options=5)
+                    expected_san = puzzle["solution"][st.session_state.puzzle_step]
+                    if expected_san not in {o["san"] for o in shuffled_p_opts}:
+                        sol_move = p_board.parse_san(expected_san)
+                        if shuffled_p_opts:
+                            shuffled_p_opts[-1] = {
+                                "rank": 1,
+                                "san": expected_san,
+                                "uci": sol_move.uci(),
+                                "eval": "Best",
+                            }
+                        else:
+                            shuffled_p_opts = [
+                                {"rank": 1, "san": expected_san, "uci": sol_move.uci(), "eval": "Best"}
+                            ]
+                        random.shuffle(shuffled_p_opts)
+
+                    st.session_state.puzzle_options_fen = cur_p_fen
+                    st.session_state.puzzle_shuffled_options = shuffled_p_opts
+
+                p_opts = st.session_state.puzzle_shuffled_options
+                if p_opts:
+                    st.markdown(f"**🎯 Candidate Moves ({len(p_opts)} choices — shuffled):**")
+                    p_cols = st.columns(len(p_opts))
+                    for idx, opt in enumerate(p_opts):
+                        if p_cols[idx].button(
+                            opt["san"],
+                            key=f"puz_btn_{cur_p_fen}_{opt['uci']}",
+                            use_container_width=True,
+                        ):
+                            chosen_m = chess.Move.from_uci(opt["uci"])
+                            if chosen_m in p_board.legal_moves:
+                                evaluate_puzzle_attempt(chosen_m)
+                                st.rerun()
+
+                c_hint, c_skip = st.columns(2)
+                if c_hint.button("💡 Show Hint", use_container_width=True):
+                    st.info(f"**Hint:** {puzzle['hint']}")
+                if c_skip.button("✨ Generate New Puzzle", use_container_width=True):
+                    load_next_puzzle(section)
+                    st.rerun()
+            else:
+                if st.button("Next Puzzle ➡️", type="primary", use_container_width=True):
+                    load_next_puzzle(section)
+                    st.rerun()
+
+            if st.session_state.puzzle_feedback:
+                st.markdown("---")
+                if st.session_state.puzzle_solved:
+                    st.success(st.session_state.puzzle_feedback)
+                elif st.session_state.puzzle_failed_attempts > 0:
+                    st.warning(st.session_state.puzzle_feedback)
+                else:
+                    st.info(st.session_state.puzzle_feedback)
+
+        with col2:
+            st.subheader("Puzzle Coach Chat")
+            chat_container = st.container(height=420, border=True)
+            with chat_container:
+                for message in st.session_state.messages:
+                    with st.chat_message(message["role"]):
+                        st.markdown(message["content"])
+
+            if p_query := st.chat_input("Ask Coach Astra for a hint on this puzzle..."):
+                st.session_state.messages.append({"role": "user", "content": p_query})
+                with st.spinner("Coach Astra is thinking..."):
+                    reply = evaluate_candidate_move_with_astra(
+                        p_board,
+                        [],
+                        p_query,
+                        p_board.turn,
+                    )
+                    st.session_state.messages.append({"role": "assistant", "content": reply})
+                st.rerun()
+
+        return
+
+    # ==========================================
+    # MODE B: PLAY FULL GAME & OPENING TRAINER
+    # ==========================================
     st.sidebar.header("Opening & Game Settings")
 
     opening_keys = list(OPENINGS.keys())
@@ -853,11 +1570,9 @@ def main():
     if col_btn2.button("🔄 New Game", use_container_width=True):
         reset_game(selected_tc, new_player_color, current_skill_level, selected_opening)
 
-    # Auto-apply immediately on initial load or when switching sides/openings before moving
     if settings_changed and not has_player_moved:
         reset_game(selected_tc, new_player_color, current_skill_level, selected_opening)
 
-    # Ensure if Black is selected on initial load and AI hasn't moved yet, AI plays White move now
     if (
         len(st.session_state.move_history) == 0
         and st.session_state.player_color == chess.BLACK
@@ -921,7 +1636,6 @@ def main():
         player_timed_out = base_time is not None and player_time == 0
 
         if game_active and not player_timed_out:
-            # 1. Text Input Form
             with st.form(key="chess_move_form", clear_on_submit=True):
                 move_input = st.text_input("Enter Move (SAN notation e.g., e4, Nf3, O-O):")
                 submit_button = st.form_submit_button("Play Move")
@@ -941,7 +1655,6 @@ def main():
                     except ValueError:
                         error_placeholder.error("Invalid move! Use SAN (e.g., e4, Nf3, O-O) or squares (e1g1).")
 
-            # 2. Randomized Top-5 Move Options Question & Buttons (Shown on Initial Load & Every Player Turn)
             if is_player_turn:
                 current_fen = st.session_state.board.fen()
                 if st.session_state.options_fen != current_fen or not st.session_state.current_shuffled_options:
@@ -969,7 +1682,6 @@ def main():
                                     process_player_turn(chosen_move, base_time, increment, current_skill_level)
                                 st.rerun()
 
-            # 3. Post-Move Ranked Feedback Breakdown (Best Move First)
             if st.session_state.last_options_feedback:
                 st.markdown("---")
                 st.markdown("#### 📊 Last Turn Options Breakdown *(Ranked Best → Next Best)*")
