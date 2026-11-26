@@ -440,23 +440,35 @@ def execute_takeback(player_color):
 # 6. Session State & Opening Setup
 # ==========================================
 def init_session_state():
-    """Sets initial variables in st.session_state."""
+    """Initializes each session state key independently to survive hot-reloads."""
     if "board" not in st.session_state:
         st.session_state.board = chess.Board()
+    if "move_history" not in st.session_state:
         st.session_state.move_history = []
+    if "coach_text" not in st.session_state:
         st.session_state.coach_text = "Welcome! Select an opening or make a move to start."
+    if "player_name" not in st.session_state:
         st.session_state.player_name = ""
+    if "game_saved" not in st.session_state:
         st.session_state.game_saved = False
+    if "is_analyzing" not in st.session_state:
         st.session_state.is_analyzing = False
+    if "takeback_used" not in st.session_state:
         st.session_state.takeback_used = False
+    if "player_color" not in st.session_state:
         st.session_state.player_color = chess.WHITE
+    if "selected_opening" not in st.session_state:
         st.session_state.selected_opening = "Free Play (Standard Start)"
+    if "time_control_key" not in st.session_state:
         st.session_state.time_control_key = "Classical (25+5)"
-        base_time, _ = TIME_CONTROLS["Classical (25+5)"]
+    if "white_time" not in st.session_state or "black_time" not in st.session_state:
+        base_time, _ = TIME_CONTROLS[st.session_state.time_control_key]
         st.session_state.white_time = base_time
         st.session_state.black_time = base_time
+    if "last_move_time" not in st.session_state:
         st.session_state.last_move_time = time.time()
-        init_chat_history()
+
+    init_chat_history()
 
 
 def reset_game(time_control_name, player_color, skill_level, opening_name="Free Play (Standard Start)"):
