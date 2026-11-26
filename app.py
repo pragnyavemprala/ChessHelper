@@ -39,13 +39,73 @@ def load_config():
 
 
 CONFIG = load_config()
-
-# Thread pool for asynchronous coach analysis
 ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 
 # ==========================================
-# 2. Database Layer (DynamoDB)
+# 2. Opening Repertoire & Time Controls
+# ==========================================
+OPENINGS = {
+    "Free Play (Standard Start)": {
+        "color": None,
+        "moves": [],
+        "description": "Standard starting position. Choose either White or Black.",
+    },
+    "Italian Game (White)": {
+        "color": chess.WHITE,
+        "moves": ["e4", "e5", "Nf3", "Nc6", "Bc4"],
+        "description": "Classical open game targeting f7 and rapid kingside development.",
+    },
+    "Ruy Lopez (White)": {
+        "color": chess.WHITE,
+        "moves": ["e4", "e5", "Nf3", "Nc6", "Bb5"],
+        "description": "Applies immediate pressure to Black's knight defending the e5 pawn.",
+    },
+    "Queen's Gambit (White)": {
+        "color": chess.WHITE,
+        "moves": ["d4", "d5", "c4"],
+        "description": "Offers a flank pawn to gain central control.",
+    },
+    "London System (White)": {
+        "color": chess.WHITE,
+        "moves": ["d4", "d5", "Bf4"],
+        "description": "Solid, principled setup with early dark-squared bishop development.",
+    },
+    "Sicilian Defense (Black)": {
+        "color": chess.BLACK,
+        "moves": ["e4", "c5"],
+        "description": "Asymmetrical counter-attack fighting for d4 from the flank.",
+    },
+    "French Defense (Black)": {
+        "color": chess.BLACK,
+        "moves": ["e4", "e6", "d4", "d5"],
+        "description": "Solid pawn chain challenging White's center immediately.",
+    },
+    "Caro-Kann Defense (Black)": {
+        "color": chess.BLACK,
+        "moves": ["e4", "c6", "d4", "d5"],
+        "description": "Supports ...d5 without blocking the light-squared bishop.",
+    },
+    "King's Indian Defense (Black)": {
+        "color": chess.BLACK,
+        "moves": ["d4", "Nf6", "c4", "g6"],
+        "description": "Hypermodern defense allowing White a broad center before striking back.",
+    },
+}
+
+TIME_CONTROLS = {
+    "Bullet (1+0)": (60, 0),
+    "Blitz (3+2)": (180, 2),
+    "Blitz (5+3)": (300, 3),
+    "Rapid (10+0)": (600, 0),
+    "Rapid (15+10)": (900, 10),
+    "Classical (25+5)": (1500, 5),
+    "Unlimited": (None, 0),
+}
+
+
+# ==========================================
+# 3. Database Layer (DynamoDB)
 # ==========================================
 @st.cache_resource
 def get_dynamo_table():
@@ -92,8 +152,11 @@ def save_game_record(player_name: str, status: str, history: list, summary: str,
 
     player_moves = [m["san"] for i, m in enumerate(history) if i % 2 == 0]
     ai_moves = [m["san"] for i, m in enumerate(history) if i % 2 != 0]
-    
-    formatted_chat = [f"{msg['role'].upper()}: {msg['content']}" for msg in chat_messages if msg.get("role") != "system"]
+    formatted_chat = [
+        f"{msg['role'].upper()}: {msg['content']}"
+        for msg in chat_messages
+        if msg.get("role") != "system"
+    ]
 
     record = {
         "player_name": player_name.strip().lower(),
@@ -116,11 +179,11 @@ def save_game_record(player_name: str, status: str, history: list, summary: str,
 
 
 # ==========================================
-# 3. Model & Engine Assets
+# 4. Model & Engine Assets
 # ==========================================
 @st.cache_resource
 def load_assets():
-    """Initializes standard LLM, GPT-6.2 Astra pre-move coach, and Stockfish engine."""
+    """Initializes standard LLM, GPT-6.2 Astra coach, and Stockfish engine."""
     chat_model = init_chat_model(
         model=CONFIG["model_id"],
         model_provider="openai",
@@ -152,19 +215,8 @@ CHAT_MODEL, ASTRA_MODEL, STOCKFISH = load_assets()
 
 
 # ==========================================
-# 4. Chess, Clock & Coach Logic
+# 5. Chess & Guided Coaching Logic
 # ==========================================
-TIME_CONTROLS = {
-    "Bullet (1+0)": (60, 0),
-    "Blitz (3+2)": (180, 2),
-    "Blitz (5+3)": (300, 3),
-    "Rapid (10+0)": (600, 0),
-    "Rapid (15+10)": (900, 10),
-    "Classical (25+5)": (1500, 5),
-    "Unlimited": (None, 0),
-}
-
-
 def render_board(board, flipped=False):
     """Renders the chess board SVG as HTML, flipped if playing as Black."""
     last_move = board.peek() if board.move_stack else None
@@ -174,7 +226,7 @@ def render_board(board, flipped=False):
 
 
 def analyze_move_task(move_history_snapshot):
-    """Runs in background thread and returns the result safely."""
+    """Runs in background thread for Coach's Corner badge and summary."""
     try:
         if not move_history_snapshot:
             return None, ""
@@ -199,8 +251,58 @@ def analyze_move_task(move_history_snapshot):
         return f"Coach analysis unavailable: {e}", ""
 
 
+def generate_guided_turn_feedback(
+    board: chess.Board,
+    move_history: list,
+    player_san: str,
+    ai_san: str | None,
+    player_color: chess.Color,
+    opening_name: str,
+) -> str:
+    """
+    Evaluates the player's played move in context of the AI's reply,
+    praising good moves or giving Socratic hints without spoiling the next move.
+    """
+    moves_str = ", ".join([m["san"] for m in move_history])
+    user_color_str = "White" if player_color == chess.WHITE else "Black"
+    ai_reply_context = (
+        f"The AI just responded with **{ai_san}**."
+        if ai_san
+        else "The game has reached a terminal state."
+    )
+
+    system_instructions = (
+        "You are an encouraging, Socratic Chess Coach guiding a student move-by-move in chat.\n"
+        f"Opening Focus: {opening_name}\n"
+        f"Student Color: {user_color_str}\n"
+        f"Full Move History: {moves_str}\n"
+        f"Current Board FEN: {board.fen()}\n\n"
+        "STRICT COACHING RULES:\n"
+        f"1. Evaluate the student's last move (**{player_san}**) in relation to the opening plan and the AI's response ({ai_san or 'Game Over'}).\n"
+        "2. If the student's move was GOOD or principled: give a warm, encouraging message explaining why it worked well.\n"
+        "3. If the student's move had a FLAW (inaccuracy, mistake, or blunder): clearly explain the flaw or missed threat, "
+        "and provide 1-2 strategic hints to help them think through the current board.\n"
+        "4. CRITICAL: NEVER tell the student the exact move to play next, and NEVER name specific destination squares or piece moves for their upcoming turn.\n"
+        "5. If the game is not over, end your message by explicitly asking the student for their next move."
+    )
+
+    messages = [
+        SystemMessage(content=system_instructions),
+        HumanMessage(
+            content=f"I just played {player_san}. {ai_reply_context} How did my move compare to the AI's response, and what should I think about next?"
+        ),
+    ]
+
+    try:
+        response = ASTRA_MODEL.invoke(messages)
+        return response.content
+    except Exception as e:
+        prompt_next = "What is your next move?" if not board.is_game_over() else "Game over!"
+        return f"You played **{player_san}**{f' and AI replied **{ai_san}**' if ai_san else ''}. (Coach note: {e}) {prompt_next}"
+
+
 def evaluate_candidate_move_with_astra(board, move_history, proposed_move_text, player_color):
-    """Uses GPT-6.2 Astra to evaluate the player's proposed move."""
+    """Uses GPT-6.2 Astra to evaluate a candidate move before the player commits."""
     moves_str = ", ".join([m["san"] for m in move_history]) if move_history else "No moves made yet"
     user_color_str = "White" if player_color == chess.WHITE else "Black"
     legal_sans = ", ".join([board.san(m) for m in board.legal_moves])
@@ -212,11 +314,11 @@ def evaluate_candidate_move_with_astra(board, move_history, proposed_move_text, 
         f"Move History: {moves_str}\n"
         f"Legal Moves in this position: {legal_sans}\n\n"
         "STRICT RULES:\n"
-        "1. Evaluate ONLY the move they proposed.\n"
-        "2. State clearly whether their proposed move is a Good Move, Dubious/Inaccurate, or a Mistake/Blunder in this position, and explain the concrete tactical or positional consequences.\n"
-        "3. NEVER recommend, suggest, name, or hint at any alternative move or different piece to play.\n"
-        "4. If their input is not a legal chess move in the current position, briefly tell them it is illegal.\n"
-        "5. Keep your response concise (1-2 short paragraphs)."
+        "1. Evaluate ONLY the candidate move they proposed.\n"
+        "2. If GOOD: encourage them to play it.\n"
+        "3. If FLAWED: explain the flaw and give a directional hint without revealing the actual best move.\n"
+        "4. NEVER recommend, suggest, name, or hint at any specific alternative move.\n"
+        "5. End by asking what move they would like to play."
     )
 
     formatted_messages = [
@@ -228,16 +330,18 @@ def evaluate_candidate_move_with_astra(board, move_history, proposed_move_text, 
         response = ASTRA_MODEL.invoke(formatted_messages)
         return response.content
     except Exception as e:
-        return f"Astra could not evaluate that move right now: {e}. Please go ahead and make your move on the board."
+        return f"Astra could not evaluate that move right now: {e}. What move would you like to play?"
 
 
 def init_chat_history():
-    """Initializes persistent chat history if not already present."""
+    """Initializes persistent chat history and archive containers."""
+    if "archived_chats" not in st.session_state:
+        st.session_state.archived_chats = []
     if "messages" not in st.session_state:
         st.session_state.messages = [
             {
                 "role": "assistant",
-                "content": "Hello! I am your AI Chess Coach powered by GPT-6.2 Astra. Ask me questions or check your candidate moves here throughout the game.",
+                "content": "Welcome! Select an opening or side in the sidebar, make your move, and I will analyze your play against the AI step by step. What is your first move?",
             }
         ]
 
@@ -245,11 +349,11 @@ def init_chat_history():
 def generate_game_summary(move_history, result_text, chat_messages):
     """Generates an end-of-game summary review incorporating move history and chat exchanges."""
     moves_str = ", ".join([m["san"] for m in move_history])
-    chat_snippet = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_messages[-6:]]) 
+    chat_snippet = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_messages[-6:]])
     messages = [
         SystemMessage(content=CONFIG["coach_prompt"]),
         HumanMessage(
-            content=f"Game finished with result '{result_text}'. Moves: {moves_str}. Recent Coach/Player Chat: {chat_snippet}. Provide a concise 2-3 sentence match summary incorporating key discussions."
+            content=f"Game finished with result '{result_text}'. Moves: {moves_str}. Recent Coach/Player Chat: {chat_snippet}. Provide a concise 2-3 sentence match summary."
         ),
     ]
     try:
@@ -305,7 +409,6 @@ def execute_takeback(player_color):
         return
 
     history_len = len(st.session_state.move_history)
-
     if player_color == chess.WHITE:
         moves_to_pop = 2 if history_len % 2 == 0 else 1
     else:
@@ -328,24 +431,26 @@ def execute_takeback(player_color):
     st.session_state.takeback_used = True
     st.session_state.last_move_time = time.time()
     st.session_state.coach_text = "Takeback used! You have 0 takebacks remaining. Make your new move."
-    
-    st.session_state.messages.append({"role": "assistant", "content": "⚠️ Takeback used. Position reverted."})
+    st.session_state.messages.append(
+        {"role": "assistant", "content": "⚠️ Takeback used and position reverted. What is your new move?"}
+    )
 
 
 # ==========================================
-# 5. Session State Management
+# 6. Session State & Opening Setup
 # ==========================================
 def init_session_state():
     """Sets initial variables in st.session_state."""
     if "board" not in st.session_state:
         st.session_state.board = chess.Board()
         st.session_state.move_history = []
-        st.session_state.coach_text = "Welcome! Make a move to start the session."
+        st.session_state.coach_text = "Welcome! Select an opening or make a move to start."
         st.session_state.player_name = ""
         st.session_state.game_saved = False
         st.session_state.is_analyzing = False
         st.session_state.takeback_used = False
         st.session_state.player_color = chess.WHITE
+        st.session_state.selected_opening = "Free Play (Standard Start)"
         st.session_state.time_control_key = "Classical (25+5)"
         base_time, _ = TIME_CONTROLS["Classical (25+5)"]
         st.session_state.white_time = base_time
@@ -354,43 +459,79 @@ def init_session_state():
         init_chat_history()
 
 
-def reset_game(time_control_name, player_color, skill_level):
-    """Resets board, color selection, time controls, and chat history."""
+def reset_game(time_control_name, player_color, skill_level, opening_name="Free Play (Standard Start)"):
+    """Archives current chat, sets up chosen opening & color, and prompts first move."""
+    # Archive previous game's chat if meaningful exchanges occurred
+    if "messages" in st.session_state and len(st.session_state.messages) > 1:
+        st.session_state.archived_chats.append(
+            {
+                "timestamp": datetime.now().strftime("%H:%M"),
+                "opening": st.session_state.get("selected_opening", "Game"),
+                "messages": list(st.session_state.messages),
+            }
+        )
+
     st.session_state.board = chess.Board()
     st.session_state.move_history = []
     st.session_state.game_saved = False
     st.session_state.is_analyzing = False
     st.session_state.takeback_used = False
-    st.session_state.player_color = player_color
+    st.session_state.selected_opening = opening_name
     st.session_state.time_control_key = time_control_name
 
     if "analysis_future" in st.session_state:
         del st.session_state["analysis_future"]
+
+    opening_cfg = OPENINGS.get(opening_name, OPENINGS["Free Play (Standard Start)"])
+    effective_color = opening_cfg["color"] if opening_cfg["color"] is not None else player_color
+    st.session_state.player_color = effective_color
 
     base_time, _ = TIME_CONTROLS.get(time_control_name, (None, 0))
     st.session_state.white_time = base_time
     st.session_state.black_time = base_time
     st.session_state.last_move_time = time.time()
 
-    st.session_state.messages = []
-    init_chat_history()
+    # Apply pre-configured opening moves
+    for san in opening_cfg["moves"]:
+        move = st.session_state.board.parse_san(san)
+        st.session_state.board.push(move)
+        st.session_state.move_history.append({"san": san, "verdict": "Book"})
 
-    if player_color == chess.BLACK:
-        ai_san = execute_ai_move(st.session_state.board, skill_level)
-        if ai_san:
-            st.session_state.move_history.append({"san": ai_san, "verdict": "AI"})
-        st.session_state.coach_text = "New game started as Black! AI (White) has opened. Make your move."
+    # If it is the AI's turn after the opening sequence (or standard Black start), AI moves now
+    ai_opening_reply = None
+    if st.session_state.board.turn != effective_color and not st.session_state.board.is_game_over():
+        ai_opening_reply = execute_ai_move(st.session_state.board, skill_level)
+        if ai_opening_reply:
+            st.session_state.move_history.append({"san": ai_opening_reply, "verdict": "AI"})
+
+    side_label = "White" if effective_color == chess.WHITE else "Black"
+    book_seq = " ".join(opening_cfg["moves"])
+
+    if opening_cfg["moves"]:
+        intro_msg = (
+            f"🎯 **Opening Loaded: {opening_name}** (Playing as **{side_label}**)\n\n"
+            f"*{opening_cfg['description']}*\n\n"
+            f"Book moves played: `{book_seq}`"
+            + (f" — AI followed up with **{ai_opening_reply}**." if ai_opening_reply else ".")
+            + "\n\nIt's your turn! What is your next move?"
+        )
     else:
-        st.session_state.coach_text = "New game started as White! Make your opening move."
+        intro_msg = (
+            f"♟️ **New Game Started as {side_label}**"
+            + (f" — AI opened with **{ai_opening_reply}**." if ai_opening_reply else ".")
+            + "\n\nWhat is your next move?"
+        )
 
+    st.session_state.messages = [{"role": "assistant", "content": intro_msg}]
+    st.session_state.coach_text = f"Practicing **{opening_name}** as **{side_label}**. Enter your move on the board!"
     st.rerun()
 
 
 # ==========================================
-# 6. UI Components & Main App
+# 7. UI Components & Main App
 # ==========================================
 def main():
-    st.set_page_config(page_title="AI Chess Coach with Clocks", layout="wide")
+    st.set_page_config(page_title="AI Chess Coach with Opening Trainer", layout="wide")
     init_session_state()
 
     # --- Sidebar Configuration ---
@@ -416,15 +557,35 @@ def main():
         st.sidebar.warning("Please enter your name to track game stats.")
 
     st.sidebar.markdown("---")
-    st.sidebar.header("Game Settings")
+    st.sidebar.header("Opening & Game Settings")
 
-    selected_side = st.sidebar.radio(
-        "Play as:",
-        options=["White", "Black"],
-        index=0 if st.session_state.player_color == chess.WHITE else 1,
-        horizontal=True,
+    selected_opening = st.sidebar.selectbox(
+        "Select Opening to Practice:",
+        options=list(OPENINGS.keys()),
+        index=list(OPENINGS.keys()).index(st.session_state.selected_opening),
     )
-    new_player_color = chess.WHITE if selected_side == "White" else chess.BLACK
+    opening_info = OPENINGS[selected_opening]
+    st.sidebar.caption(opening_info["description"])
+
+    # Lock color selector if opening dictates White or Black; allow choice on Free Play
+    if opening_info["color"] is not None:
+        forced_side = "White" if opening_info["color"] == chess.WHITE else "Black"
+        st.sidebar.radio(
+            "Play as (Set by Opening):",
+            options=["White", "Black"],
+            index=0 if opening_info["color"] == chess.WHITE else 1,
+            horizontal=True,
+            disabled=True,
+        )
+        new_player_color = opening_info["color"]
+    else:
+        selected_side = st.sidebar.radio(
+            "Play as:",
+            options=["White", "Black"],
+            index=0 if st.session_state.player_color == chess.WHITE else 1,
+            horizontal=True,
+        )
+        new_player_color = chess.WHITE if selected_side == "White" else chess.BLACK
 
     selected_tc = st.sidebar.selectbox(
         "Time Control",
@@ -440,18 +601,23 @@ def main():
         help="1 is easiest, 20 is Grandmaster level.",
     )
 
-    settings_changed = (new_player_color != st.session_state.player_color) or (
-        selected_tc != st.session_state.time_control_key
+    settings_changed = (
+        (selected_opening != st.session_state.selected_opening)
+        or (new_player_color != st.session_state.player_color)
+        or (selected_tc != st.session_state.time_control_key)
     )
 
-    if settings_changed and len(st.session_state.move_history) > 0:
-        st.sidebar.warning("Changing settings will start a new game.")
+    has_player_moved = any(
+        m.get("verdict") not in ("Book", "AI") for m in st.session_state.move_history
+    )
+
+    if settings_changed and has_player_moved:
+        st.sidebar.warning("Click 'New Game' to apply your new opening/settings.")
 
     col_btn1, col_btn2 = st.sidebar.columns(2)
-
     can_takeback = (
         not st.session_state.takeback_used
-        and len(st.session_state.move_history) > 0
+        and has_player_moved
         and not st.session_state.board.is_game_over()
     )
     takeback_label = "↩️ Takeback (1)" if not st.session_state.takeback_used else "↩️ Takeback (0)"
@@ -461,12 +627,13 @@ def main():
         st.rerun()
 
     if col_btn2.button("🔄 New Game", use_container_width=True):
-        reset_game(selected_tc, new_player_color, current_skill_level)
+        reset_game(selected_tc, new_player_color, current_skill_level, selected_opening)
 
-    if settings_changed and len(st.session_state.move_history) == 0:
-        reset_game(selected_tc, new_player_color, current_skill_level)
+    # Auto-apply immediately if the user hasn't made a personal move yet
+    if settings_changed and not has_player_moved:
+        reset_game(selected_tc, new_player_color, current_skill_level, selected_opening)
 
-    # --- Clock Management & Timeouts ---
+    # --- Clock Management ---
     base_time, increment = TIME_CONTROLS[st.session_state.time_control_key]
     if base_time is not None and not st.session_state.board.is_game_over():
         elapsed = time.time() - st.session_state.last_move_time
@@ -484,13 +651,20 @@ def main():
     col1, col2 = st.columns([3, 2])
 
     with col1:
+        player_time = (
+            st.session_state.white_time
+            if st.session_state.player_color == chess.WHITE
+            else st.session_state.black_time
+        )
+        game_active = not st.session_state.board.is_game_over() and (
+            base_time is None or player_time > 0
+        )
+
         if base_time is not None:
             w_min, w_sec = divmod(int(st.session_state.white_time), 60)
             b_min, b_sec = divmod(int(st.session_state.black_time), 60)
             col_clock1, col_clock2 = st.columns(2)
-            
-            player_time = st.session_state.white_time if st.session_state.player_color == chess.WHITE else st.session_state.black_time
-            
+
             if st.session_state.player_color == chess.WHITE:
                 col_clock1.metric("⏱️ White (You)", f"{w_min:02d}:{w_sec:02d}")
                 col_clock2.metric("⏱️ Black (AI)", f"{b_min:02d}:{b_sec:02d}")
@@ -498,8 +672,7 @@ def main():
                 col_clock1.metric("⏱️ Black (You)", f"{b_min:02d}:{b_sec:02d}")
                 col_clock2.metric("⏱️ White (AI)", f"{w_min:02d}:{w_sec:02d}")
 
-            game_active = not st.session_state.board.is_game_over() and player_time > 0
-            if game_active and player_time < 300: 
+            if game_active and player_time < 300:
                 if st.button("➕ Add 2 Minutes (+120s)", use_container_width=True):
                     if st.session_state.player_color == chess.WHITE:
                         st.session_state.white_time += 120
@@ -513,11 +686,7 @@ def main():
         st.write(render_board(st.session_state.board, flipped=is_board_flipped), unsafe_allow_html=True)
 
         is_player_turn = st.session_state.board.turn == st.session_state.player_color
-        player_timed_out = (
-            st.session_state.white_time == 0
-            if st.session_state.player_color == chess.WHITE
-            else st.session_state.black_time == 0
-        )
+        player_timed_out = base_time is not None and player_time == 0
 
         if game_active and not player_timed_out:
             with st.form(key="chess_move_form", clear_on_submit=True):
@@ -543,15 +712,32 @@ def main():
                             st.session_state.board.push(move)
                             st.session_state.move_history.append({"san": san_move, "verdict": "Analyzing..."})
 
+                            # Background analysis for Coach's Corner badge
                             st.session_state.is_analyzing = True
                             st.session_state.analysis_future = ANALYSIS_EXECUTOR.submit(
                                 analyze_move_task, list(st.session_state.move_history)
                             )
 
+                            # AI counter-move
+                            ai_san = None
                             if not st.session_state.board.is_game_over():
                                 ai_san = execute_ai_move(st.session_state.board, current_skill_level)
                                 if ai_san:
                                     st.session_state.move_history.append({"san": ai_san, "verdict": "AI"})
+
+                            # Log move in chat history and generate Socratic guided feedback
+                            move_log = f"Played **{san_move}**" + (f" (AI replied **{ai_san}**)" if ai_san else "")
+                            st.session_state.messages.append({"role": "user", "content": move_log})
+
+                            guided_reply = generate_guided_turn_feedback(
+                                board=st.session_state.board,
+                                move_history=st.session_state.move_history,
+                                player_san=san_move,
+                                ai_san=ai_san,
+                                player_color=st.session_state.player_color,
+                                opening_name=st.session_state.selected_opening,
+                            )
+                            st.session_state.messages.append({"role": "assistant", "content": guided_reply})
 
                             st.rerun()
                         else:
@@ -576,7 +762,7 @@ def main():
                         st.session_state.coach_text = analysis
                     if st.session_state.move_history:
                         for i in range(len(st.session_state.move_history) - 1, -1, -1):
-                            if st.session_state.move_history[i].get("verdict") != "AI":
+                            if st.session_state.move_history[i].get("verdict") not in ("AI", "Book"):
                                 st.session_state.move_history[i]["verdict"] = verdict
                                 break
                 except Exception:
@@ -586,18 +772,18 @@ def main():
 
             bg_color = "#f0f2f6"
             if st.session_state.move_history:
-                history_len = len(st.session_state.move_history)
-                target_idx = history_len - 1 if history_len % 2 != 0 else history_len - 2
-                if target_idx >= 0:
-                    latest_verdict = st.session_state.move_history[target_idx].get("verdict", "").upper()
-                    if "[GOOD]" in latest_verdict:
-                        bg_color = "#d4edda"
-                    elif "[INACCURACY]" in latest_verdict:
-                        bg_color = "#fff3cd"
-                    elif "[MISTAKE]" in latest_verdict:
-                        bg_color = "#ffe5d0"
-                    elif "[BLUNDER]" in latest_verdict:
-                        bg_color = "#f8d7da"
+                for item in reversed(st.session_state.move_history):
+                    if item.get("verdict") not in ("AI", "Book"):
+                        latest_verdict = item.get("verdict", "").upper()
+                        if "[GOOD]" in latest_verdict:
+                            bg_color = "#d4edda"
+                        elif "[INACCURACY]" in latest_verdict:
+                            bg_color = "#fff3cd"
+                        elif "[MISTAKE]" in latest_verdict:
+                            bg_color = "#ffe5d0"
+                        elif "[BLUNDER]" in latest_verdict:
+                            bg_color = "#f8d7da"
+                        break
 
             analysis_display = st.session_state.coach_text
             if st.session_state.is_analyzing:
@@ -615,16 +801,17 @@ def main():
 
         render_coach_corner()
 
-        st.markdown("#### Chat with Coach & Astra")
-        chat_container = st.container(height=320)
+        st.markdown("#### Guided Coaching Chat")
+        # Scrollable container preserving full game chat history
+        chat_container = st.container(height=360, border=True)
         with chat_container:
             for message in st.session_state.messages:
                 with st.chat_message(message["role"]):
                     st.markdown(message["content"])
 
-        if user_query := st.chat_input("Ask your coach about strategy or check candidate moves..."):
+        if user_query := st.chat_input("Test a candidate move (e.g., Nf6) or ask for a hint..."):
             st.session_state.messages.append({"role": "user", "content": user_query})
-            with st.spinner("GPT-6.2 Astra is thinking..."):
+            with st.spinner("Coach Astra is analyzing..."):
                 if len(user_query.split()) <= 2:
                     reply = evaluate_candidate_move_with_astra(
                         st.session_state.board,
@@ -633,18 +820,31 @@ def main():
                         st.session_state.player_color,
                     )
                 else:
-                    chat_history_objs = []
-                    for m in st.session_state.messages:
-                        if m["role"] == "user":
-                            chat_history_objs.append(HumanMessage(content=m["content"]))
-                        elif m["role"] == "assistant":
-                            chat_history_objs.append(AIMessage(content=m["content"]))
-                    
-                    response = CHAT_MODEL.invoke([SystemMessage(content=CONFIG["coach_prompt"])] + chat_history_objs)
+                    guided_system = (
+                        f"{CONFIG['coach_prompt']}\n\n"
+                        f"Current Opening: {st.session_state.selected_opening}\n"
+                        f"Current FEN: {st.session_state.board.fen()}\n"
+                        "IMPORTANT: Never reveal the exact best move or destination square. "
+                        "Give strategic hints only and end by asking the student for their next move."
+                    )
+                    chat_history_objs = [
+                        HumanMessage(content=m["content"]) if m["role"] == "user" else AIMessage(content=m["content"])
+                        for m in st.session_state.messages
+                    ]
+                    response = CHAT_MODEL.invoke([SystemMessage(content=guided_system)] + chat_history_objs)
                     reply = response.content
 
                 st.session_state.messages.append({"role": "assistant", "content": reply})
             st.rerun()
+
+        # Optional viewer for previous games' chat transcripts during the session
+        if st.session_state.archived_chats:
+            with st.expander(f"📜 Previous Game Chats ({len(st.session_state.archived_chats)})"):
+                for idx, archive in enumerate(reversed(st.session_state.archived_chats), 1):
+                    st.markdown(f"**Game {idx}: {archive['opening']}** *(ended {archive['timestamp']})*")
+                    for msg in archive["messages"]:
+                        st.caption(f"**{msg['role'].upper()}:** {msg['content']}")
+                    st.divider()
 
         handle_game_completion()
 
@@ -655,26 +855,20 @@ def main():
     pairs = []
     for i in range(0, len(history), 2):
         move_num = (i // 2) + 1
-        if st.session_state.player_color == chess.WHITE:
-            w_data = history[i]
-            b_data = history[i + 1] if i + 1 < len(history) else {"san": "...", "verdict": "AI"}
-        else:
-            b_data = history[i]
-            w_data = history[i + 1] if i + 1 < len(history) else {"san": "...", "verdict": "AI"}
+        w_data = history[i]
+        b_data = history[i + 1] if i + 1 < len(history) else {"san": "...", "verdict": ""}
         pairs.append((move_num, w_data, b_data))
 
     for m_num, w, b in reversed(pairs):
         w_verdict = f" `{w['verdict']}`" if w.get("verdict") and w["verdict"] != "Analyzing..." else ""
         b_verdict = f" `{b['verdict']}`" if b.get("verdict") and b["verdict"] != "Analyzing..." else ""
-        if st.session_state.player_color == chess.WHITE:
-            st.sidebar.markdown(f"**{m_num}.** {w['san']}{w_verdict} &nbsp;&nbsp; {b['san']}{b_verdict}")
-        else:
-            st.sidebar.markdown(f"**{m_num}.** {w['san']}{w_verdict} &nbsp;&nbsp; {b['san']}{b_verdict}")
+        st.sidebar.markdown(f"**{m_num}.** {w['san']}{w_verdict} &nbsp;&nbsp; {b['san']}{b_verdict}")
 
 
 def handle_game_completion():
     """Handles end-of-game checks and triggers DynamoDB record write once."""
-    player_timed_out = (
+    base_time, _ = TIME_CONTROLS[st.session_state.time_control_key]
+    player_timed_out = base_time is not None and (
         st.session_state.white_time == 0
         if st.session_state.player_color == chess.WHITE
         else st.session_state.black_time == 0
