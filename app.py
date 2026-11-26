@@ -94,6 +94,31 @@ OPENINGS = {
     },
 }
 
+# Instant book responses for common move-1 positions so UI never stalls on start
+OPENING_BOOK_TOP5 = {
+    chess.STARTING_FEN: [
+        {"rank": 1, "san": "e4", "uci": "e2e4", "eval": "+0.30"},
+        {"rank": 2, "san": "d4", "uci": "d2d4", "eval": "+0.28"},
+        {"rank": 3, "san": "Nf3", "uci": "g1f3", "eval": "+0.25"},
+        {"rank": 4, "san": "c4", "uci": "c2c4", "eval": "+0.22"},
+        {"rank": 5, "san": "g3", "uci": "g2g3", "eval": "+0.15"},
+    ],
+    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1": [  # After 1. e4
+        {"rank": 1, "san": "c5", "uci": "c7c5", "eval": "+0.25"},
+        {"rank": 2, "san": "e5", "uci": "e7e5", "eval": "+0.28"},
+        {"rank": 3, "san": "e6", "uci": "e7e6", "eval": "+0.32"},
+        {"rank": 4, "san": "c6", "uci": "c7c6", "eval": "+0.34"},
+        {"rank": 5, "san": "d6", "uci": "d7d6", "eval": "+0.45"},
+    ],
+    "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq - 0 1": [  # After 1. d4
+        {"rank": 1, "san": "Nf6", "uci": "g8f6", "eval": "+0.25"},
+        {"rank": 2, "san": "d5", "uci": "d7d5", "eval": "+0.28"},
+        {"rank": 3, "san": "e6", "uci": "e7e6", "eval": "+0.32"},
+        {"rank": 4, "san": "f5", "uci": "f7f5", "eval": "+0.45"},
+        {"rank": 5, "san": "c6", "uci": "c7c6", "eval": "+0.48"},
+    ],
+}
+
 TIME_CONTROLS = {
     "Bullet (1+0)": (60, 0),
     "Blitz (3+2)": (180, 2),
@@ -201,7 +226,7 @@ def load_assets():
     sf = None
     for path in possible_paths:
         try:
-            sf = Stockfish(path=path)
+            sf = Stockfish(path=path, depth=10, parameters={"Threads": 1, "Hash": 32})
             break
         except Exception:
             continue
@@ -228,20 +253,29 @@ def render_board(board, flipped=False):
 
 def get_ranked_move_options(board: chess.Board, num_options: int = 5):
     """
-    Returns up to `num_options` legal moves ranked from best to next-best by Stockfish,
+    Returns up to `num_options` legal moves ranked from best to next-best,
     along with a randomized display list for multiple-choice buttons.
+    Uses fast book lookup for move 1 and shallow depth=8 MultiPV for midgame speed.
     """
     legal_moves = list(board.legal_moves)
     if not legal_moves:
         return [], []
 
     limit = min(num_options, len(legal_moves))
-    ranked = []
+    current_fen = board.fen()
 
+    # Instant lookup for standard starting positions
+    if current_fen in OPENING_BOOK_TOP5:
+        ranked = [dict(item) for item in OPENING_BOOK_TOP5[current_fen][:limit]]
+        shuffled = list(ranked)
+        random.shuffle(shuffled)
+        return ranked, shuffled
+
+    ranked = []
     if STOCKFISH:
         try:
-            STOCKFISH.set_skill_level(20)  # Full strength for accurate move ranking
-            STOCKFISH.set_fen_position(board.fen())
+            STOCKFISH.set_depth(8)  # Keep shallow so MultiPV=5 finishes in <150ms
+            STOCKFISH.set_fen_position(current_fen)
             top_moves = STOCKFISH.get_top_moves(limit)
 
             for idx, item in enumerate(top_moves, 1):
@@ -263,7 +297,7 @@ def get_ranked_move_options(board: chess.Board, num_options: int = 5):
         except Exception:
             ranked = []
 
-    # Fallback if Stockfish returned fewer moves or errored
+    # Fallback if Stockfish returned fewer moves or timed out
     if len(ranked) < limit:
         existing_sans = {r["san"] for r in ranked}
         for m in legal_moves:
@@ -284,64 +318,6 @@ def get_ranked_move_options(board: chess.Board, num_options: int = 5):
     shuffled = list(ranked)
     random.shuffle(shuffled)
     return ranked, shuffled
-
-
-def generate_options_feedback(
-    fen_before_move: str,
-    ranked_options: list,
-    chosen_san: str,
-    player_color: chess.Color,
-) -> str:
-    """
-    Generates concise feedback on each of the 5 candidate options ordered strictly
-    from #1 Best Move down to #5, highlighting which move the player chose.
-    """
-    if not ranked_options:
-        return ""
-
-    user_color_str = "White" if player_color == chess.WHITE else "Black"
-    options_summary = "\n".join(
-        [
-            f"Rank #{opt['rank']}: {opt['san']} (Engine Eval: {opt['eval']})"
-            + (" <-- PLAYER CHOSE THIS" if opt["san"] == chosen_san else "")
-            for opt in ranked_options
-        ]
-    )
-
-    system_instructions = (
-        "You are a concise, insightful Chess Grandmaster coach reviewing multiple-choice move options after a student has played.\n"
-        f"Student Color: {user_color_str}\n"
-        f"Position FEN (before student moved): {fen_before_move}\n"
-        f"Student Played: {chosen_san}\n\n"
-        "Ranked Options (Best to Next Best):\n"
-        f"{options_summary}\n\n"
-        "STRICT FORMATTING RULES:\n"
-        "1. List EVERY option in exact rank order starting with **#1 (Best Move)** down to the last option.\n"
-        "2. For each option, give 1 crisp sentence explaining why it is best, playable, or inferior in that position.\n"
-        "3. Explicitly tag whichever option the student played with `(Your Move)` (or note at the bottom if they typed a move outside the 5 options).\n"
-        "4. Keep the entire breakdown scannable using bullet points."
-    )
-
-    messages = [
-        SystemMessage(content=system_instructions),
-        HumanMessage(
-            content=f"I played {chosen_san}. Please give quick feedback on all {len(ranked_options)} options starting with the best move."
-        ),
-    ]
-
-    try:
-        response = ASTRA_MODEL.invoke(messages)
-        return response.content
-    except Exception:
-        # Deterministic fallback if LLM call fails
-        lines = []
-        for opt in ranked_options:
-            tag = " **(Your Move)**" if opt["san"] == chosen_san else ""
-            best_label = " — Best Move" if opt["rank"] == 1 else ""
-            lines.append(f"- **#{opt['rank']}. {opt['san']}** (`{opt['eval']}`){best_label}{tag}")
-        if chosen_san not in {o["san"] for o in ranked_options}:
-            lines.append(f"- **Your Move ({chosen_san}):** Played outside the top {len(ranked_options)} engine choices.")
-        return "\n".join(lines)
 
 
 def analyze_move_task(move_history_snapshot):
@@ -370,54 +346,80 @@ def analyze_move_task(move_history_snapshot):
         return f"Coach analysis unavailable: {e}", ""
 
 
-def generate_guided_turn_feedback(
-    board: chess.Board,
+def generate_turn_coaching_bundle(
+    fen_before_move: str,
+    board_after: chess.Board,
     move_history: list,
-    player_san: str,
+    ranked_options: list,
+    chosen_san: str,
     ai_san: str | None,
     player_color: chess.Color,
     opening_name: str,
-) -> str:
+) -> tuple[str, str]:
     """
-    Evaluates the player's played move in context of the AI's reply,
-    praising good moves or giving Socratic hints without spoiling the next move.
+    Single fast LLM call returning BOTH:
+    1. Ranked feedback on all 5 candidate options (starting with #1 Best Move).
+    2. Socratic guided chat feedback evaluating the played move vs. AI reply
+       without spoiling the upcoming move.
     """
-    moves_str = ", ".join([m["san"] for m in move_history])
     user_color_str = "White" if player_color == chess.WHITE else "Black"
-    ai_reply_context = (
-        f"The AI just responded with **{ai_san}**."
-        if ai_san
-        else "The game has reached a terminal state."
+    moves_str = ", ".join([m["san"] for m in move_history])
+    options_summary = "\n".join(
+        [
+            f"Rank #{opt['rank']}: {opt['san']} (Eval: {opt['eval']})"
+            + (" <-- STUDENT PLAYED" if opt["san"] == chosen_san else "")
+            for opt in ranked_options
+        ]
     )
 
     system_instructions = (
-        "You are an encouraging, Socratic Chess Coach guiding a student move-by-move in chat.\n"
-        f"Opening Focus: {opening_name}\n"
-        f"Student Color: {user_color_str}\n"
-        f"Full Move History: {moves_str}\n"
-        f"Current Board FEN: {board.fen()}\n\n"
-        "STRICT COACHING RULES:\n"
-        f"1. Evaluate the student's last move (**{player_san}**) in relation to the opening plan and the AI's response ({ai_san or 'Game Over'}).\n"
-        "2. If the student's move was GOOD or principled: give a warm, encouraging message explaining why it worked well.\n"
-        "3. If the student's move had a FLAW (inaccuracy, mistake, or blunder): clearly explain the flaw or missed threat, "
-        "and provide 1-2 strategic hints to help them think through the current board.\n"
-        "4. CRITICAL: NEVER tell the student the exact move to play next, and NEVER name specific destination squares or piece moves for their upcoming turn.\n"
-        "5. If the game is not over, end your message by explicitly asking the student for their next move."
+        "You are a concise, Socratic Chess Grandmaster Coach.\n"
+        f"Opening: {opening_name} | Student Color: {user_color_str}\n"
+        f"FEN before student move: {fen_before_move}\n"
+        f"Student Played: {chosen_san} | AI Replied: {ai_san or 'Game Over'}\n"
+        f"Full Move History: {moves_str}\n\n"
+        f"Candidate Options Ranked Best to 5th Best:\n{options_summary}\n\n"
+        "Output TWO clearly separated sections using the exact delimiter `===CHAT_COACH===`:\n\n"
+        "SECTION 1 (Before delimiter): Ranked breakdown of EVERY option starting with **#1 (Best Move)** down to the last option. "
+        "Give 1 crisp bullet per option explaining why it is best, playable, or flawed, and tag the student's move with `(Your Move)`.\n\n"
+        "===CHAT_COACH===\n\n"
+        "SECTION 2 (After delimiter): Socratic chat reply to the student:\n"
+        f"- Evaluate **{chosen_san}** relative to the opening and the AI's reply (**{ai_san or 'Game Over'}**).\n"
+        "- If GOOD: give an encouraging message.\n"
+        "- If FLAWED: explain the flaw and give 1-2 hints.\n"
+        "- CRITICAL: NEVER reveal or name the exact move or destination square to play next.\n"
+        "- End by asking the student for their next move."
     )
 
-    messages = [
-        SystemMessage(content=system_instructions),
-        HumanMessage(
-            content=f"I just played {player_san}. {ai_reply_context} How did my move compare to the AI's response, and what should I think about next?"
-        ),
-    ]
-
     try:
-        response = ASTRA_MODEL.invoke(messages)
-        return response.content
-    except Exception as e:
-        prompt_next = "What is your next move?" if not board.is_game_over() else "Game over!"
-        return f"You played **{player_san}**{f' and AI replied **{ai_san}**' if ai_san else ''}. (Coach note: {e}) {prompt_next}"
+        response = ASTRA_MODEL.invoke(
+            [
+                SystemMessage(content=system_instructions),
+                HumanMessage(content=f"I played {chosen_san}. Review the 5 options and guide my next turn."),
+            ]
+        )
+        raw = response.content
+        if "===CHAT_COACH===" in raw:
+            options_part, chat_part = raw.split("===CHAT_COACH===", 1)
+            return options_part.strip(), chat_part.strip()
+        return raw.strip(), raw.strip()
+    except Exception:
+        # Instant deterministic fallback so UI never hangs
+        lines = []
+        for opt in ranked_options:
+            tag = " **(Your Move)**" if opt["san"] == chosen_san else ""
+            best_label = " — Best Move" if opt["rank"] == 1 else ""
+            lines.append(f"- **#{opt['rank']}. {opt['san']}** (`{opt['eval']}`){best_label}{tag}")
+        if ranked_options and chosen_san not in {o["san"] for o in ranked_options}:
+            lines.append(f"- **Your Move ({chosen_san}):** Played outside the top {len(ranked_options)} options.")
+
+        next_prompt = "What is your next move?" if not board_after.is_game_over() else "Game over!"
+        chat_fallback = (
+            f"You played **{chosen_san}**"
+            + (f" and the AI answered with **{ai_san}**." if ai_san else ".")
+            + f" Look at how the center and piece activity changed. {next_prompt}"
+        )
+        return "\n".join(lines), chat_fallback
 
 
 def evaluate_candidate_move_with_astra(board, move_history, proposed_move_text, player_color):
@@ -460,7 +462,7 @@ def init_chat_history():
         st.session_state.messages = [
             {
                 "role": "assistant",
-                "content": "Welcome! Select an opening or side in the sidebar, type a move or pick from the candidate buttons below the board, and I will guide you step by step. What is your first move?",
+                "content": "Welcome! Pick one of the 5 candidate opening moves below the board or type your move to begin. What is your first move?",
             }
         ]
 
@@ -486,15 +488,24 @@ def execute_ai_move(board, skill_level):
     """Executes a Stockfish counter-move immediately."""
     if not STOCKFISH or board.is_game_over():
         return None
-    STOCKFISH.set_skill_level(skill_level)
-    STOCKFISH.set_fen_position(board.fen())
-    best_move_uci = STOCKFISH.get_best_move_time(50)
+    try:
+        STOCKFISH.set_skill_level(skill_level)
+        STOCKFISH.set_fen_position(board.fen())
+        best_move_uci = STOCKFISH.get_best_move_time(50)
 
-    if best_move_uci:
-        ai_move = chess.Move.from_uci(best_move_uci)
-        ai_san = board.san(ai_move)
-        board.push(ai_move)
-        return ai_san
+        if best_move_uci:
+            ai_move = chess.Move.from_uci(best_move_uci)
+            ai_san = board.san(ai_move)
+            board.push(ai_move)
+            return ai_san
+    except Exception:
+        # Fallback to a random legal move if Stockfish subprocess hiccups
+        legal = list(board.legal_moves)
+        if legal:
+            ai_move = random.choice(legal)
+            ai_san = board.san(ai_move)
+            board.push(ai_move)
+            return ai_san
     return None
 
 
@@ -530,8 +541,8 @@ def process_player_turn(
 ):
     """
     Executes the player's move (from either typed input or option button),
-    generates ranked feedback for all 5 options starting with the best move,
-    plays the AI reply, and updates the guided coaching chat.
+    plays the AI reply, generates ranked feedback for all 5 options starting
+    with the best move, and updates the guided coaching chat.
     """
     fen_before = st.session_state.board.fen()
     ranked_snapshot = list(st.session_state.get("current_ranked_options", []))
@@ -546,21 +557,30 @@ def process_player_turn(
     st.session_state.board.push(move)
     st.session_state.move_history.append({"san": san_move, "verdict": "Analyzing..."})
 
-    # Generate ranked feedback on the 5 options starting with #1 Best Move
-    if ranked_snapshot:
-        st.session_state.last_options_feedback = generate_options_feedback(
-            fen_before_move=fen_before,
-            ranked_options=ranked_snapshot,
-            chosen_san=san_move,
-            player_color=st.session_state.player_color,
-        )
-    else:
-        st.session_state.last_options_feedback = ""
-
     # Clear cached options so next turn generates fresh candidates
     st.session_state.options_fen = None
     st.session_state.current_ranked_options = []
     st.session_state.current_shuffled_options = []
+
+    # AI counter-move first so chat guidance reflects the full turn
+    ai_san = None
+    if not st.session_state.board.is_game_over():
+        ai_san = execute_ai_move(st.session_state.board, current_skill_level)
+        if ai_san:
+            st.session_state.move_history.append({"san": ai_san, "verdict": "AI"})
+
+    # Single combined LLM call for Options Ranked Feedback + Socratic Chat Reply
+    options_feedback, guided_reply = generate_turn_coaching_bundle(
+        fen_before_move=fen_before,
+        board_after=st.session_state.board,
+        move_history=st.session_state.move_history,
+        ranked_options=ranked_snapshot,
+        chosen_san=san_move,
+        ai_san=ai_san,
+        player_color=st.session_state.player_color,
+        opening_name=st.session_state.selected_opening,
+    )
+    st.session_state.last_options_feedback = options_feedback
 
     # Background analysis for Coach's Corner badge
     st.session_state.is_analyzing = True
@@ -568,25 +588,8 @@ def process_player_turn(
         analyze_move_task, list(st.session_state.move_history)
     )
 
-    # AI counter-move
-    ai_san = None
-    if not st.session_state.board.is_game_over():
-        ai_san = execute_ai_move(st.session_state.board, current_skill_level)
-        if ai_san:
-            st.session_state.move_history.append({"san": ai_san, "verdict": "AI"})
-
-    # Log move in chat history and generate Socratic guided feedback
     move_log = f"Played **{san_move}**" + (f" (AI replied **{ai_san}**)" if ai_san else "")
     st.session_state.messages.append({"role": "user", "content": move_log})
-
-    guided_reply = generate_guided_turn_feedback(
-        board=st.session_state.board,
-        move_history=st.session_state.move_history,
-        player_san=san_move,
-        ai_san=ai_san,
-        player_color=st.session_state.player_color,
-        opening_name=st.session_state.selected_opening,
-    )
     st.session_state.messages.append({"role": "assistant", "content": guided_reply})
 
 
@@ -637,7 +640,7 @@ def init_session_state():
     if "move_history" not in st.session_state:
         st.session_state.move_history = []
     if "coach_text" not in st.session_state:
-        st.session_state.coach_text = "Welcome! Select an opening or make a move to start."
+        st.session_state.coach_text = "Welcome! Select an opening or pick one of the 5 candidate moves below the board."
     if "player_name" not in st.session_state:
         st.session_state.player_name = ""
     if "game_saved" not in st.session_state:
@@ -671,7 +674,7 @@ def init_session_state():
 
 
 def reset_game(time_control_name, player_color, skill_level, opening_name="Free Play (Standard Start)"):
-    """Archives current chat, sets up chosen opening & color, and prompts first move."""
+    """Archives current chat, sets up chosen opening & color, and prepares top-5 options."""
     if "messages" in st.session_state and len(st.session_state.messages) > 1:
         st.session_state.archived_chats.append(
             {
@@ -710,11 +713,18 @@ def reset_game(time_control_name, player_color, skill_level, opening_name="Free 
         st.session_state.board.push(move)
         st.session_state.move_history.append({"san": san, "verdict": "Book"})
 
+    # If playing Black (or opening ends with White to move), AI plays White's move immediately
     ai_opening_reply = None
     if st.session_state.board.turn != effective_color and not st.session_state.board.is_game_over():
         ai_opening_reply = execute_ai_move(st.session_state.board, skill_level)
         if ai_opening_reply:
             st.session_state.move_history.append({"san": ai_opening_reply, "verdict": "AI"})
+
+    # Pre-populate the top-5 candidate moves immediately for the player's turn
+    ranked_opts, shuffled_opts = get_ranked_move_options(st.session_state.board, num_options=5)
+    st.session_state.options_fen = st.session_state.board.fen()
+    st.session_state.current_ranked_options = ranked_opts
+    st.session_state.current_shuffled_options = shuffled_opts
 
     side_label = "White" if effective_color == chess.WHITE else "Black"
     book_seq = " ".join(opening_cfg["moves"])
@@ -725,17 +735,17 @@ def reset_game(time_control_name, player_color, skill_level, opening_name="Free 
             f"*{opening_cfg['description']}*\n\n"
             f"Book moves played: `{book_seq}`"
             + (f" — AI followed up with **{ai_opening_reply}**." if ai_opening_reply else ".")
-            + "\n\nIt's your turn! What is your next move?"
+            + "\n\nPick one of the 5 candidate moves below the board or type your own! What is your next move?"
         )
     else:
         intro_msg = (
             f"♟️ **New Game Started as {side_label}**"
-            + (f" — AI opened with **{ai_opening_reply}**." if ai_opening_reply else ".")
-            + "\n\nWhat is your next move?"
+            + (f" — AI (White) opened with **{ai_opening_reply}**." if ai_opening_reply else ".")
+            + "\n\nChoose from the 5 top candidate moves below the board or enter your move. What is your next move?"
         )
 
     st.session_state.messages = [{"role": "assistant", "content": intro_msg}]
-    st.session_state.coach_text = f"Practicing **{opening_name}** as **{side_label}**. Enter your move or pick an option below the board!"
+    st.session_state.coach_text = f"Playing as **{side_label}** ({opening_name}). Pick a move from the 5 options below the board!"
     st.rerun()
 
 
@@ -843,8 +853,17 @@ def main():
     if col_btn2.button("🔄 New Game", use_container_width=True):
         reset_game(selected_tc, new_player_color, current_skill_level, selected_opening)
 
+    # Auto-apply immediately on initial load or when switching sides/openings before moving
     if settings_changed and not has_player_moved:
         reset_game(selected_tc, new_player_color, current_skill_level, selected_opening)
+
+    # Ensure if Black is selected on initial load and AI hasn't moved yet, AI plays White move now
+    if (
+        len(st.session_state.move_history) == 0
+        and st.session_state.player_color == chess.BLACK
+        and st.session_state.board.turn == chess.WHITE
+    ):
+        reset_game(selected_tc, chess.BLACK, current_skill_level, selected_opening)
 
     # --- Clock Management ---
     base_time, increment = TIME_CONTROLS[st.session_state.time_control_key]
@@ -908,15 +927,13 @@ def main():
                 submit_button = st.form_submit_button("Play Move")
 
             if submit_button and move_input:
-                if not st.session_state.player_name:
-                    error_placeholder.warning("Please enter your player name in the sidebar before moving.")
-                elif not is_player_turn:
+                if not is_player_turn:
                     error_placeholder.warning("Please wait for your turn.")
                 else:
                     try:
                         move = parse_player_move(st.session_state.board, move_input)
                         if move in st.session_state.board.legal_moves:
-                            with st.spinner("Evaluating move options & AI response..."):
+                            with st.spinner("Analyzing move options & AI response..."):
                                 process_player_turn(move, base_time, increment, current_skill_level)
                             st.rerun()
                         else:
@@ -924,19 +941,20 @@ def main():
                     except ValueError:
                         error_placeholder.error("Invalid move! Use SAN (e.g., e4, Nf3, O-O) or squares (e1g1).")
 
-            # 2. Randomized Top-5 Move Options Question & Buttons
+            # 2. Randomized Top-5 Move Options Question & Buttons (Shown on Initial Load & Every Player Turn)
             if is_player_turn:
                 current_fen = st.session_state.board.fen()
-                if st.session_state.options_fen != current_fen:
+                if st.session_state.options_fen != current_fen or not st.session_state.current_shuffled_options:
                     ranked_opts, shuffled_opts = get_ranked_move_options(st.session_state.board, num_options=5)
                     st.session_state.options_fen = current_fen
                     st.session_state.current_ranked_options = ranked_opts
                     st.session_state.current_shuffled_options = shuffled_opts
 
                 shuffled_opts = st.session_state.current_shuffled_options
+                side_text = "White" if st.session_state.player_color == chess.WHITE else "Black"
                 if shuffled_opts:
                     st.markdown(
-                        f"**🎯 Quick Move Challenge:** Which of these {len(shuffled_opts)} candidate moves would you like to play? *(Shuffled order)*"
+                        f"**🎯 Best {side_text} Move Challenge:** Pick one of the top {len(shuffled_opts)} candidate moves *(displayed in random order)*:"
                     )
                     btn_cols = st.columns(len(shuffled_opts))
                     for idx, opt in enumerate(shuffled_opts):
@@ -945,14 +963,11 @@ def main():
                             key=f"opt_btn_{current_fen}_{opt['uci']}",
                             use_container_width=True,
                         ):
-                            if not st.session_state.player_name:
-                                error_placeholder.warning("Please enter your player name in the sidebar before moving.")
-                            else:
-                                chosen_move = chess.Move.from_uci(opt["uci"])
-                                if chosen_move in st.session_state.board.legal_moves:
-                                    with st.spinner(f"Playing {opt['san']} and ranking all options..."):
-                                        process_player_turn(chosen_move, base_time, increment, current_skill_level)
-                                    st.rerun()
+                            chosen_move = chess.Move.from_uci(opt["uci"])
+                            if chosen_move in st.session_state.board.legal_moves:
+                                with st.spinner(f"Playing {opt['san']} and ranking all options..."):
+                                    process_player_turn(chosen_move, base_time, increment, current_skill_level)
+                                st.rerun()
 
             # 3. Post-Move Ranked Feedback Breakdown (Best Move First)
             if st.session_state.last_options_feedback:
