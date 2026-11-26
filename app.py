@@ -93,7 +93,6 @@ def save_game_record(player_name: str, status: str, history: list, summary: str,
     player_moves = [m["san"] for i, m in enumerate(history) if i % 2 == 0]
     ai_moves = [m["san"] for i, m in enumerate(history) if i % 2 != 0]
     
-    # Serialize chat messages into a readable format for DynamoDB
     formatted_chat = [f"{msg['role'].upper()}: {msg['content']}" for msg in chat_messages if msg.get("role") != "system"]
 
     record = {
@@ -201,9 +200,7 @@ def analyze_move_task(move_history_snapshot):
 
 
 def evaluate_candidate_move_with_astra(board, move_history, proposed_move_text, player_color):
-    """
-    Uses GPT-6.2 Astra to evaluate the player's proposed move.
-    """
+    """Uses GPT-6.2 Astra to evaluate the player's proposed move."""
     moves_str = ", ".join([m["san"] for m in move_history]) if move_history else "No moves made yet"
     user_color_str = "White" if player_color == chess.WHITE else "Black"
     legal_sans = ", ".join([board.san(m) for m in board.legal_moves])
@@ -216,5 +213,116 @@ def evaluate_candidate_move_with_astra(board, move_history, proposed_move_text, 
         f"Legal Moves in this position: {legal_sans}\n\n"
         "STRICT RULES:\n"
         "1. Evaluate ONLY the move they proposed.\n"
-        "2. State clearly whether their proposed move is a **Good Move**, **Dubious/Inaccurate**, or a **Mistake/Blunder** in this position, and explain the concrete tactical or positional consequences.\n"
-        "
+        "2. State clearly whether their proposed move is a Good Move, Dubious/Inaccurate, or a Mistake/Blunder in this position, and explain the concrete tactical or positional consequences.\n"
+        "3. NEVER recommend, suggest, name, or hint at any alternative move or different piece to play.\n"
+        "4. If their input is not a legal chess move in the current position, briefly tell them it is illegal.\n"
+        "5. Keep your response concise (1-2 short paragraphs)."
+    )
+
+    formatted_messages = [
+        SystemMessage(content=system_instructions),
+        HumanMessage(content=f"I am thinking of playing: {proposed_move_text}"),
+    ]
+
+    try:
+        response = ASTRA_MODEL.invoke(formatted_messages)
+        return response.content
+    except Exception as e:
+        return f"Astra could not evaluate that move right now: {e}. Please go ahead and make your move on the board."
+
+
+def init_chat_history():
+    """Initializes persistent chat history if not already present."""
+    if "messages" not in st.session_state:
+        st.session_state.messages = [
+            {
+                "role": "assistant",
+                "content": "Hello! I am your AI Chess Coach powered by GPT-6.2 Astra. Ask me questions or check your candidate moves here throughout the game.",
+            }
+        ]
+
+
+def generate_game_summary(move_history, result_text, chat_messages):
+    """Generates an end-of-game summary review incorporating move history and chat exchanges."""
+    moves_str = ", ".join([m["san"] for m in move_history])
+    chat_snippet = "\n".join([f"{msg['role']}: {msg['content']}" for msg in chat_messages[-6:]]) 
+    messages = [
+        SystemMessage(content=CONFIG["coach_prompt"]),
+        HumanMessage(
+            content=f"Game finished with result '{result_text}'. Moves: {moves_str}. Recent Coach/Player Chat: {chat_snippet}. Provide a concise 2-3 sentence match summary incorporating key discussions."
+        ),
+    ]
+    try:
+        response = CHAT_MODEL.invoke(messages)
+        return response.content
+    except Exception:
+        return "Game concluded."
+
+
+def execute_ai_move(board, skill_level):
+    """Executes a Stockfish counter-move immediately."""
+    if not STOCKFISH or board.is_game_over():
+        return None
+    STOCKFISH.set_skill_level(skill_level)
+    STOCKFISH.set_fen_position(board.fen())
+    best_move_uci = STOCKFISH.get_best_move_time(50)
+
+    if best_move_uci:
+        ai_move = chess.Move.from_uci(best_move_uci)
+        ai_san = board.san(ai_move)
+        board.push(ai_move)
+        return ai_san
+    return None
+
+
+def parse_player_move(board: chess.Board, text: str) -> chess.Move:
+    """Parses user input into a valid chess.Move."""
+    cleaned = text.strip()
+    castling_map = {
+        "0-0-0": "O-O-O", "o-o-o": "O-O-O", "ooo": "O-O-O",
+        "0-0": "O-O", "o-o": "O-O", "oo": "O-O",
+    }
+    cleaned = castling_map.get(cleaned.lower(), cleaned)
+
+    try:
+        return board.parse_san(cleaned)
+    except ValueError:
+        pass
+
+    try:
+        uci_move = chess.Move.from_uci(cleaned.lower())
+        if uci_move in board.legal_moves:
+            return uci_move
+    except ValueError:
+        pass
+
+    raise ValueError(f"'{text}' is not recognized as a legal SAN or UCI move.")
+
+
+def execute_takeback(player_color):
+    """Reverts the player's last turn taking side color into account."""
+    if st.session_state.takeback_used or not st.session_state.move_history:
+        return
+
+    history_len = len(st.session_state.move_history)
+
+    if player_color == chess.WHITE:
+        moves_to_pop = 2 if history_len % 2 == 0 else 1
+    else:
+        moves_to_pop = 2 if history_len % 2 != 0 and history_len > 0 else 0
+
+    if moves_to_pop == 0:
+        return
+
+    for _ in range(moves_to_pop):
+        if st.session_state.board.move_stack:
+            st.session_state.board.pop()
+        if st.session_state.move_history:
+            st.session_state.move_history.pop()
+
+    st.session_state.is_analyzing = False
+    if "analysis_future" in st.session_state:
+        st.session_state.analysis_future.cancel()
+        del st.session_state["analysis_future"]
+
+    st.session_
